@@ -18,7 +18,18 @@ pub const MAX_SPINE: usize = 256;
 /// Maximum byte length of the OPF file path inside the ZIP.
 pub const OPF_PATH_CAP: usize = 256;
 
-/// EPUB book metadata (title and author), stored inline with fixed-size buffers.
+/// Media type of a cover image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverMediaType {
+    /// JPEG image.
+    Jpeg,
+    /// PNG image.
+    Png,
+    /// Unknown or unsupported media type.
+    Unknown,
+}
+
+/// EPUB book metadata (title, author, and cover), stored inline with fixed-size buffers.
 pub struct EpubMeta {
     /// Raw UTF-8 bytes of the title (up to [`TITLE_CAP`] bytes).
     pub title: [u8; TITLE_CAP],
@@ -28,6 +39,10 @@ pub struct EpubMeta {
     pub author: [u8; AUTHOR_CAP],
     /// Number of valid bytes in [`author`](Self::author).
     pub author_len: u8,
+    /// ZIP entry index of the cover image, or `0xFFFF` if no cover was found.
+    pub cover_zip_index: u16,
+    /// Media type of the cover image (meaningful only when [`cover_zip_index`](Self::cover_zip_index) ≠ `0xFFFF`).
+    pub cover_media_type: CoverMediaType,
 }
 
 impl Default for EpubMeta {
@@ -37,6 +52,9 @@ impl Default for EpubMeta {
 }
 
 impl EpubMeta {
+    /// Sentinel value for [`cover_zip_index`](Self::cover_zip_index) meaning "no cover".
+    pub const NO_COVER: u16 = 0xFFFF;
+
     /// Create a new, empty `EpubMeta`.
     pub const fn new() -> Self {
         Self {
@@ -44,6 +62,8 @@ impl EpubMeta {
             title_len: 0,
             author: [0u8; AUTHOR_CAP],
             author_len: 0,
+            cover_zip_index: Self::NO_COVER,
+            cover_media_type: CoverMediaType::Unknown,
         }
     }
 
@@ -55,6 +75,11 @@ impl EpubMeta {
     /// Return the author as a `&str`, or `""` if it is not valid UTF-8.
     pub fn author_str(&self) -> &str {
         core::str::from_utf8(&self.author[..self.author_len as usize]).unwrap_or("")
+    }
+
+    /// Returns `true` if a cover image was found in the EPUB metadata.
+    pub fn has_cover(&self) -> bool {
+        self.cover_zip_index != Self::NO_COVER
     }
 
     fn set_title(&mut self, s: &[u8]) {
@@ -273,6 +298,11 @@ pub fn parse_opf(
         meta.set_author(author);
     }
 
+    // ── cover discovery ─────────────────────────────────────────────
+    // Try EPUB 3 first: <item properties="cover-image" href="..." media-type="..."/>
+    // Then EPUB 2: <meta name="cover" content="<manifest-id>"/>
+    find_cover(opf, opf_dir, zip, meta);
+
     // phase 1: collect idref byte offsets; get_attr returns subslices so
     // pointer subtraction gives the offset; (start,len) = 4B each = 1KB total
 
@@ -342,6 +372,99 @@ pub fn parse_opf(
     }
 
     Ok(())
+}
+
+// ── cover discovery ─────────────────────────────────────────────────
+
+/// Resolve a manifest `<item>` tag's `href` + `media-type` to a cover
+/// entry in `meta`. Sets `cover_zip_index` and `cover_media_type`.
+fn resolve_cover_item(tag_bytes: &[u8], opf_dir: &str, zip: &ZipIndex, meta: &mut EpubMeta) {
+    let Some(href) = xml::get_attr(tag_bytes, b"href") else {
+        return;
+    };
+
+    let decoded_href = percent_decode(href);
+    let href_str = core::str::from_utf8(&decoded_href).unwrap_or("");
+    let mut path_buf = [0u8; 512];
+    let full_len = resolve_path(opf_dir, href_str, &mut path_buf);
+    let full_path = core::str::from_utf8(&path_buf[..full_len]).unwrap_or("");
+
+    let Some(idx) = zip.find(full_path).or_else(|| zip.find_icase(full_path)) else {
+        return;
+    };
+
+    let media_type = xml::get_attr(tag_bytes, b"media-type").unwrap_or(b"");
+    meta.cover_media_type = match media_type {
+        b"image/jpeg" | b"image/jpg" => CoverMediaType::Jpeg,
+        b"image/png" => CoverMediaType::Png,
+        _ => CoverMediaType::Unknown,
+    };
+    meta.cover_zip_index = idx as u16;
+}
+
+/// Search the OPF manifest for a cover image.
+///
+/// Tries EPUB 3 `properties="cover-image"` first, then falls back to
+/// EPUB 2 `<meta name="cover" content="<manifest-id>">`.
+fn find_cover(opf: &[u8], opf_dir: &str, zip: &ZipIndex, meta: &mut EpubMeta) {
+    // EPUB 3: <item properties="cover-image" .../>
+    let mut found = false;
+    xml::for_each_tag(opf, b"item", |tag_bytes| {
+        if found {
+            return;
+        }
+        if let Some(props) = xml::get_attr(tag_bytes, b"properties") {
+            if props == b"cover-image" || props.split(|&b| b == b' ').any(|w| w == b"cover-image")
+            {
+                resolve_cover_item(tag_bytes, opf_dir, zip, meta);
+                if meta.has_cover() {
+                    found = true;
+                    log::info!("epub: cover found via EPUB3 properties (zip #{})", meta.cover_zip_index);
+                }
+            }
+        }
+    });
+    if found {
+        return;
+    }
+
+    // EPUB 2: <meta name="cover" content="<manifest-id>"/>
+    let mut cover_id_buf = [0u8; 128];
+    let mut cover_id_len: usize = 0;
+    xml::for_each_tag(opf, b"meta", |tag_bytes| {
+        if cover_id_len > 0 {
+            return;
+        }
+        if let Some(name) = xml::get_attr(tag_bytes, b"name") {
+            if name == b"cover" {
+                if let Some(content) = xml::get_attr(tag_bytes, b"content") {
+                    let n = content.len().min(cover_id_buf.len());
+                    cover_id_buf[..n].copy_from_slice(&content[..n]);
+                    cover_id_len = n;
+                }
+            }
+        }
+    });
+
+    if cover_id_len == 0 {
+        return;
+    }
+
+    let target_id = &cover_id_buf[..cover_id_len];
+    xml::for_each_tag(opf, b"item", |tag_bytes| {
+        if found {
+            return;
+        }
+        if let Some(id) = xml::get_attr(tag_bytes, b"id") {
+            if id == target_id {
+                resolve_cover_item(tag_bytes, opf_dir, zip, meta);
+                if meta.has_cover() {
+                    found = true;
+                    log::info!("epub: cover found via EPUB2 meta (zip #{})", meta.cover_zip_index);
+                }
+            }
+        }
+    });
 }
 
 // locate TOC in ZIP: EPUB 3 nav first, EPUB 2 NCX fallback
@@ -1014,4 +1137,162 @@ pub fn is_epub_filename(name: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal EPUB 3 OPF with `properties="cover-image"` on a manifest item.
+    const EPUB3_OPF: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata>
+    <dc:title>Test Book</dc:title>
+    <dc:creator>Test Author</dc:creator>
+  </metadata>
+  <manifest>
+    <item id="cover-img" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+  </spine>
+</package>"#;
+
+    /// Minimal EPUB 2 OPF with `<meta name="cover" content="cover-img"/>`.
+    const EPUB2_OPF: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata>
+    <dc:title>Old Book</dc:title>
+    <dc:creator>Old Author</dc:creator>
+    <meta name="cover" content="my-cover"/>
+  </metadata>
+  <manifest>
+    <item id="my-cover" href="cover.png" media-type="image/png"/>
+    <item id="ch1" href="chapter1.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+  </spine>
+</package>"#;
+
+    /// OPF with no cover metadata at all.
+    const NO_COVER_OPF: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata>
+    <dc:title>No Cover</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+  </spine>
+</package>"#;
+
+    /// OPF with both EPUB2 meta and EPUB3 properties — EPUB3 should win.
+    const BOTH_OPF: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata>
+    <dc:title>Both</dc:title>
+    <meta name="cover" content="old-cover"/>
+  </metadata>
+  <manifest>
+    <item id="old-cover" href="old.png" media-type="image/png"/>
+    <item id="new-cover" href="new.jpg" media-type="image/jpeg" properties="cover-image"/>
+    <item id="ch1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+  </spine>
+</package>"#;
+
+    fn make_zip(names: &[&str]) -> ZipIndex {
+        ZipIndex::from_names(names)
+    }
+
+    #[test]
+    fn epub3_cover_image() {
+        let zip = make_zip(&[
+            "OEBPS/images/cover.jpg",
+            "OEBPS/chapter1.xhtml",
+        ]);
+        let mut meta = EpubMeta::new();
+        let mut spine = EpubSpine::new();
+        parse_opf(EPUB3_OPF, "OEBPS", &zip, &mut meta, &mut spine).unwrap();
+
+        assert!(meta.has_cover());
+        assert_eq!(meta.cover_zip_index, 0); // first entry
+        assert_eq!(meta.cover_media_type, CoverMediaType::Jpeg);
+        assert_eq!(meta.title_str(), "Test Book");
+    }
+
+    #[test]
+    fn epub2_meta_cover() {
+        let zip = make_zip(&[
+            "cover.png",
+            "chapter1.html",
+        ]);
+        let mut meta = EpubMeta::new();
+        let mut spine = EpubSpine::new();
+        parse_opf(EPUB2_OPF, "", &zip, &mut meta, &mut spine).unwrap();
+
+        assert!(meta.has_cover());
+        assert_eq!(meta.cover_zip_index, 0);
+        assert_eq!(meta.cover_media_type, CoverMediaType::Png);
+        assert_eq!(meta.title_str(), "Old Book");
+    }
+
+    #[test]
+    fn no_cover_metadata() {
+        let zip = make_zip(&["chapter1.xhtml"]);
+        let mut meta = EpubMeta::new();
+        let mut spine = EpubSpine::new();
+        parse_opf(NO_COVER_OPF, "", &zip, &mut meta, &mut spine).unwrap();
+
+        assert!(!meta.has_cover());
+        assert_eq!(meta.cover_zip_index, EpubMeta::NO_COVER);
+    }
+
+    #[test]
+    fn epub3_takes_priority_over_epub2() {
+        let zip = make_zip(&[
+            "OEBPS/old.png",
+            "OEBPS/new.jpg",
+            "OEBPS/chapter1.xhtml",
+        ]);
+        let mut meta = EpubMeta::new();
+        let mut spine = EpubSpine::new();
+        parse_opf(BOTH_OPF, "OEBPS", &zip, &mut meta, &mut spine).unwrap();
+
+        assert!(meta.has_cover());
+        assert_eq!(meta.cover_zip_index, 1); // new.jpg
+        assert_eq!(meta.cover_media_type, CoverMediaType::Jpeg);
+    }
+
+    #[test]
+    fn cover_with_subdirectory_path() {
+        // Cover href has a subdirectory relative to opf_dir
+        let zip = make_zip(&[
+            "Content/Images/front.jpg",
+            "Content/text.xhtml",
+        ]);
+        let opf = br#"<?xml version="1.0"?>
+<package>
+  <metadata><dc:title>Sub</dc:title></metadata>
+  <manifest>
+    <item id="cv" href="Images/front.jpg" media-type="image/jpeg" properties="cover-image"/>
+    <item id="ch1" href="text.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+
+        let mut meta = EpubMeta::new();
+        let mut spine = EpubSpine::new();
+        parse_opf(opf, "Content", &zip, &mut meta, &mut spine).unwrap();
+
+        assert!(meta.has_cover());
+        assert_eq!(meta.cover_zip_index, 0);
+        assert_eq!(meta.cover_media_type, CoverMediaType::Jpeg);
+    }
 }

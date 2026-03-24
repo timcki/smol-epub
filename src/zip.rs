@@ -423,3 +423,27 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+impl ZipIndex {
+    /// Build a `ZipIndex` from a slice of filenames (test helper).
+    ///
+    /// Each name becomes an entry with dummy offsets/sizes.
+    pub fn from_names(names: &[&str]) -> Self {
+        let mut zi = Self::new();
+        for (i, name) in names.iter().enumerate() {
+            let ns = zi.names.len();
+            zi.names.extend_from_slice(name.as_bytes());
+            zi.entries[i] = ZipEntry {
+                name_start: ns as u16,
+                name_len: name.len() as u16,
+                local_offset: 0,
+                comp_size: 0,
+                uncomp_size: 0,
+                method: 0,
+            };
+            zi.count += 1;
+        }
+        zi
+    }
+}
