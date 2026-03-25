@@ -14,7 +14,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::html_strip::HtmlStripStream;
-use crate::zip::{ZipEntry, ZipIndex, METHOD_DEFLATE, METHOD_STORED};
+use crate::zip::{METHOD_DEFLATE, METHOD_STORED, ZipEntry, ZipIndex};
 
 const CACHE_MAGIC: u32 = 0x504C_5043; // "PLPC"
 const CACHE_VERSION: u8 = 2;
@@ -559,8 +559,8 @@ fn stream_deflate<E>(
     read_fn: &mut impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
     output_fn: &mut impl FnMut(&[u8]) -> Result<(), &'static str>,
 ) -> Result<u32, &'static str> {
-    use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
     use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 
     let comp_size = entry.comp_size as usize;
     let uncomp_size = entry.uncomp_size;

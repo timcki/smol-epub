@@ -35,7 +35,7 @@ const MAX_COMP: usize = 4;
 const MAX_PIXELS: u32 = 2048 * 2048;
 
 // header bytes to read for marker parsing; large APP/EXIF segments skipped by length
-const HEADER_READ: usize = 32768;
+const HEADER_READ: usize = 49152; // 48 KB — enough for JPEGs with large EXIF/XMP APP segments
 
 // chunk size for streaming reads during MCU decode
 const CHUNK_SIZE: usize = 4096;
@@ -288,8 +288,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
 
     // decompress more data into the circular window
     fn pump(&mut self) -> Result<(), &'static str> {
-        use miniz_oxide::inflate::core::{decompress, inflate_flags};
         use miniz_oxide::inflate::TINFLStatus;
+        use miniz_oxide::inflate::core::{decompress, inflate_flags};
 
         if self.done {
             return Ok(());
@@ -747,10 +747,16 @@ fn scan_sof_dimensions(data: &[u8]) -> Result<(u16, u16), &'static str> {
                     return Err("jpeg: truncated marker");
                 }
                 let seg = be_u16(data, pos) as usize;
-                if seg < 2 || pos + seg > len {
+                if seg < 2 {
                     return Err("jpeg: bad marker length");
                 }
-                pos += seg;
+                if pos + seg > len {
+                    // segment extends past header buffer (large EXIF/XMP);
+                    // skip to end and let the loop report "truncated"
+                    pos = len;
+                } else {
+                    pos += seg;
+                }
             }
         }
     }
@@ -991,10 +997,18 @@ fn parse_markers(data: &[u8]) -> Result<Box<JpegState>, &'static str> {
                     return Err("jpeg: truncated marker");
                 }
                 let seg = be_u16(data, pos) as usize;
-                if seg < 2 || pos + seg > len {
+                if seg < 2 {
                     return Err("jpeg: bad marker length");
                 }
-                pos += seg;
+                if pos + seg > len {
+                    // segment extends past header buffer (e.g. large EXIF);
+                    // skip to end — the markers we need (SOF/DQT/DHT/SOS)
+                    // come after this segment and will be found once
+                    // HEADER_READ is large enough, or we'll hit "truncated"
+                    pos = len;
+                } else {
+                    pos += seg;
+                }
             }
         }
     }

@@ -414,12 +414,14 @@ fn find_cover(opf: &[u8], opf_dir: &str, zip: &ZipIndex, meta: &mut EpubMeta) {
             return;
         }
         if let Some(props) = xml::get_attr(tag_bytes, b"properties") {
-            if props == b"cover-image" || props.split(|&b| b == b' ').any(|w| w == b"cover-image")
-            {
+            if props == b"cover-image" || props.split(|&b| b == b' ').any(|w| w == b"cover-image") {
                 resolve_cover_item(tag_bytes, opf_dir, zip, meta);
                 if meta.has_cover() {
                     found = true;
-                    log::info!("epub: cover found via EPUB3 properties (zip #{})", meta.cover_zip_index);
+                    log::info!(
+                        "epub: cover found via EPUB3 properties (zip #{})",
+                        meta.cover_zip_index
+                    );
                 }
             }
         }
@@ -460,7 +462,10 @@ fn find_cover(opf: &[u8], opf_dir: &str, zip: &ZipIndex, meta: &mut EpubMeta) {
                 resolve_cover_item(tag_bytes, opf_dir, zip, meta);
                 if meta.has_cover() {
                     found = true;
-                    log::info!("epub: cover found via EPUB2 meta (zip #{})", meta.cover_zip_index);
+                    log::info!(
+                        "epub: cover found via EPUB2 meta (zip #{})",
+                        meta.cover_zip_index
+                    );
                 }
             }
         }
@@ -1213,10 +1218,7 @@ mod tests {
 
     #[test]
     fn epub3_cover_image() {
-        let zip = make_zip(&[
-            "OEBPS/images/cover.jpg",
-            "OEBPS/chapter1.xhtml",
-        ]);
+        let zip = make_zip(&["OEBPS/images/cover.jpg", "OEBPS/chapter1.xhtml"]);
         let mut meta = EpubMeta::new();
         let mut spine = EpubSpine::new();
         parse_opf(EPUB3_OPF, "OEBPS", &zip, &mut meta, &mut spine).unwrap();
@@ -1229,10 +1231,7 @@ mod tests {
 
     #[test]
     fn epub2_meta_cover() {
-        let zip = make_zip(&[
-            "cover.png",
-            "chapter1.html",
-        ]);
+        let zip = make_zip(&["cover.png", "chapter1.html"]);
         let mut meta = EpubMeta::new();
         let mut spine = EpubSpine::new();
         parse_opf(EPUB2_OPF, "", &zip, &mut meta, &mut spine).unwrap();
@@ -1256,11 +1255,7 @@ mod tests {
 
     #[test]
     fn epub3_takes_priority_over_epub2() {
-        let zip = make_zip(&[
-            "OEBPS/old.png",
-            "OEBPS/new.jpg",
-            "OEBPS/chapter1.xhtml",
-        ]);
+        let zip = make_zip(&["OEBPS/old.png", "OEBPS/new.jpg", "OEBPS/chapter1.xhtml"]);
         let mut meta = EpubMeta::new();
         let mut spine = EpubSpine::new();
         parse_opf(BOTH_OPF, "OEBPS", &zip, &mut meta, &mut spine).unwrap();
@@ -1273,10 +1268,7 @@ mod tests {
     #[test]
     fn cover_with_subdirectory_path() {
         // Cover href has a subdirectory relative to opf_dir
-        let zip = make_zip(&[
-            "Content/Images/front.jpg",
-            "Content/text.xhtml",
-        ]);
+        let zip = make_zip(&["Content/Images/front.jpg", "Content/text.xhtml"]);
         let opf = br#"<?xml version="1.0"?>
 <package>
   <metadata><dc:title>Sub</dc:title></metadata>

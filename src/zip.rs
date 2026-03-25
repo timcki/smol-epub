@@ -318,10 +318,10 @@ fn extract_deflate<E, F>(
 where
     F: FnMut(u32, &mut [u8]) -> Result<usize, E>,
 {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::DecompressorOxide;
     use miniz_oxide::inflate::core::decompress;
     use miniz_oxide::inflate::core::inflate_flags;
-    use miniz_oxide::inflate::core::DecompressorOxide;
-    use miniz_oxide::inflate::TINFLStatus;
 
     let comp_size = entry.comp_size as usize;
     let uncomp_size = entry.uncomp_size as usize;

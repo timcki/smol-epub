@@ -351,8 +351,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateSource<F> {
     }
 
     fn pump(&mut self) -> Result<(), &'static str> {
-        use miniz_oxide::inflate::core::{decompress, inflate_flags};
         use miniz_oxide::inflate::TINFLStatus;
+        use miniz_oxide::inflate::core::{decompress, inflate_flags};
 
         if self.done {
             return Ok(());
