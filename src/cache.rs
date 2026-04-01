@@ -745,6 +745,365 @@ pub fn strip_html_buf(xhtml: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+// ── resumable stream-strip step API ─────────────────────────────────
+
+/// Iterations per step call (matches async yield frequency).
+const STEP_ITERATIONS: u32 = 8;
+
+/// Outcome of a single [`StreamStripStep::step`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StripStepResult {
+    /// Made progress; call [`step`](StreamStripStep::step) again.
+    Continue,
+    /// Stream complete. The contained value is the total number of
+    /// bytes written through the output callback across all steps.
+    Done(u32),
+}
+
+/// Resumable stream-decompress + HTML-strip state machine.
+///
+/// Holds all intermediate decompression and stripping state so that
+/// callers can advance the pipeline in bounded increments instead of
+/// running to completion in one call.
+///
+/// # Heap usage
+///
+/// Peak ≈ 47 KB while active (same as [`stream_strip_entry`]):
+/// - `DecompressorOxide` ~11 KB (DEFLATE only)
+/// - sliding window 32 KB (DEFLATE only)
+/// - read buffer 4 KB
+///
+/// All heap memory is freed when the step state is dropped.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let mut step = StreamStripStep::new(&entry, local_offset, &mut read_fn)?;
+/// loop {
+///     match step.step(&mut read_fn, &mut output_fn)? {
+///         StripStepResult::Continue => { /* check input, etc. */ }
+///         StripStepResult::Done(total) => break,
+///     }
+/// }
+/// ```
+pub struct StreamStripStep {
+    method: u16,
+
+    // DEFLATE state (None for stored entries)
+    decomp: Option<Box<miniz_oxide::inflate::core::DecompressorOxide>>,
+    window: Vec<u8>,
+
+    // shared buffers
+    rbuf: Vec<u8>,
+    in_avail: usize,
+    file_pos: u32,
+    comp_left: usize,
+    out_pos: usize,     // write position in circular window (deflate)
+    remaining: u32,     // bytes left to read (stored)
+
+    // HTML stripper
+    stripper: HtmlStripStream,
+    strip_buf: [u8; STRIP_BUF_SIZE],
+    strip_pos: usize,
+    total_written: u32,
+
+    done: bool,
+}
+
+impl StreamStripStep {
+    /// Create a new resumable stream-strip state machine.
+    ///
+    /// Reads the 30-byte local file header to compute the data offset,
+    /// then allocates the buffers appropriate for the compression method.
+    pub fn new<E>(
+        entry: &ZipEntry,
+        local_offset: u32,
+        read_fn: &mut impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
+    ) -> Result<Self, &'static str> {
+        // Read the 30-byte local file header to find the data start.
+        let mut header = [0u8; 30];
+        read_fn(local_offset, &mut header).map_err(|_| "cache: read local header failed")?;
+        let skip = ZipIndex::local_header_data_skip(&header)?;
+        let data_offset = local_offset + skip;
+
+        match entry.method {
+            METHOD_STORED => {
+                let mut rbuf = Vec::new();
+                rbuf.try_reserve_exact(READ_BUF_SIZE)
+                    .map_err(|_| "cache: OOM for read buffer")?;
+                rbuf.resize(READ_BUF_SIZE, 0);
+
+                Ok(Self {
+                    method: METHOD_STORED,
+                    decomp: None,
+                    window: Vec::new(),
+                    rbuf,
+                    in_avail: 0,
+                    file_pos: data_offset,
+                    comp_left: 0,
+                    out_pos: 0,
+                    remaining: entry.uncomp_size,
+                    stripper: HtmlStripStream::new(),
+                    strip_buf: [0u8; STRIP_BUF_SIZE],
+                    strip_pos: 0,
+                    total_written: 0,
+                    done: false,
+                })
+            }
+            METHOD_DEFLATE => {
+                use miniz_oxide::inflate::core::DecompressorOxide;
+
+                // ~11KB DecompressorOxide; alloc zeroed directly
+                // (Box::new overflows stack on embedded targets).
+                let decomp_ptr = unsafe {
+                    alloc::alloc::alloc_zeroed(
+                        core::alloc::Layout::new::<DecompressorOxide>(),
+                    )
+                };
+                if decomp_ptr.is_null() {
+                    return Err("cache: OOM for decompressor");
+                }
+                let decomp =
+                    unsafe { Box::from_raw(decomp_ptr as *mut DecompressorOxide) };
+
+                let mut window = Vec::new();
+                window
+                    .try_reserve_exact(WINDOW_SIZE)
+                    .map_err(|_| "cache: OOM for window")?;
+                window.resize(WINDOW_SIZE, 0);
+
+                let mut rbuf = Vec::new();
+                rbuf.try_reserve_exact(READ_BUF_SIZE)
+                    .map_err(|_| "cache: OOM for read buffer")?;
+                rbuf.resize(READ_BUF_SIZE, 0);
+
+                Ok(Self {
+                    method: METHOD_DEFLATE,
+                    decomp: Some(decomp),
+                    window,
+                    rbuf,
+                    in_avail: 0,
+                    file_pos: data_offset,
+                    comp_left: entry.comp_size as usize,
+                    out_pos: 0,
+                    remaining: 0,
+                    stripper: HtmlStripStream::new(),
+                    strip_buf: [0u8; STRIP_BUF_SIZE],
+                    strip_pos: 0,
+                    total_written: 0,
+                    done: false,
+                })
+            }
+            _ => Err("cache: unsupported compression method"),
+        }
+    }
+
+    /// Returns `true` once the stream has been fully consumed.
+    #[inline]
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Advance the pipeline by a bounded amount of work.
+    ///
+    /// - **Stored entries** read and strip one chunk (up to 4 KB).
+    /// - **Deflate entries** run up to [`STEP_ITERATIONS`] decompression
+    ///   iterations.
+    ///
+    /// Returns [`StripStepResult::Continue`] when more work remains, or
+    /// [`StripStepResult::Done`] with the total bytes written when the
+    /// stream is complete.
+    pub fn step<E>(
+        &mut self,
+        read_fn: &mut impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
+        output_fn: &mut impl FnMut(&[u8]) -> Result<(), &'static str>,
+    ) -> Result<StripStepResult, &'static str> {
+        if self.done {
+            return Ok(StripStepResult::Done(self.total_written));
+        }
+        match self.method {
+            METHOD_STORED => self.step_stored(read_fn, output_fn),
+            METHOD_DEFLATE => self.step_deflate(read_fn, output_fn),
+            _ => unreachable!(),
+        }
+    }
+
+    /// One read+strip pass for a stored entry (bounded to READ_BUF_SIZE).
+    fn step_stored<E>(
+        &mut self,
+        read_fn: &mut impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
+        output_fn: &mut impl FnMut(&[u8]) -> Result<(), &'static str>,
+    ) -> Result<StripStepResult, &'static str> {
+        if self.remaining == 0 {
+            // Flush trailing stripper state (deferred newlines, etc.).
+            let trailing = self.stripper.finish(&mut self.strip_buf[self.strip_pos..]);
+            self.strip_pos += trailing;
+            if self.strip_pos > 0 {
+                output_fn(&self.strip_buf[..self.strip_pos])?;
+                self.total_written += self.strip_pos as u32;
+                self.strip_pos = 0;
+            }
+            self.done = true;
+            return Ok(StripStepResult::Done(self.total_written));
+        }
+
+        let want = (self.remaining as usize).min(READ_BUF_SIZE);
+        let n = read_fn(self.file_pos, &mut self.rbuf[..want])
+            .map_err(|_| "cache: read failed (stored)")?;
+        if n == 0 {
+            return Err("cache: unexpected EOF in stored entry");
+        }
+        self.file_pos += n as u32;
+        self.remaining -= n as u32;
+
+        feed_and_flush(
+            &mut self.stripper,
+            &self.rbuf[..n],
+            &mut self.strip_buf,
+            &mut self.strip_pos,
+            &mut self.total_written,
+            output_fn,
+        )?;
+
+        if self.remaining == 0 {
+            // Flush trailing stripper state.
+            let trailing = self.stripper.finish(&mut self.strip_buf[self.strip_pos..]);
+            self.strip_pos += trailing;
+            if self.strip_pos > 0 {
+                output_fn(&self.strip_buf[..self.strip_pos])?;
+                self.total_written += self.strip_pos as u32;
+                self.strip_pos = 0;
+            }
+            self.done = true;
+            return Ok(StripStepResult::Done(self.total_written));
+        }
+
+        Ok(StripStepResult::Continue)
+    }
+
+    /// Up to STEP_ITERATIONS decompression iterations for a deflate entry.
+    fn step_deflate<E>(
+        &mut self,
+        read_fn: &mut impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
+        output_fn: &mut impl FnMut(&[u8]) -> Result<(), &'static str>,
+    ) -> Result<StripStepResult, &'static str> {
+        use miniz_oxide::inflate::TINFLStatus;
+        use miniz_oxide::inflate::core::{decompress, inflate_flags};
+
+        let decomp = self.decomp.as_mut().unwrap();
+
+        for _ in 0..STEP_ITERATIONS {
+            // Top up read buffer.
+            if self.in_avail < READ_BUF_SIZE && self.comp_left > 0 {
+                let space = READ_BUF_SIZE - self.in_avail;
+                let want = space.min(self.comp_left);
+                match read_fn(
+                    self.file_pos,
+                    &mut self.rbuf[self.in_avail..self.in_avail + want],
+                ) {
+                    Ok(n) if n > 0 => {
+                        self.file_pos += n as u32;
+                        self.comp_left -= n;
+                        self.in_avail += n;
+                    }
+                    Ok(_) => {
+                        self.comp_left = 0;
+                    }
+                    Err(_) => return Err("cache: read failed during deflate"),
+                }
+            }
+
+            if self.in_avail == 0 && self.out_pos == 0 {
+                return Err("cache: empty deflate stream");
+            }
+
+            // Circular-buffer mode: do NOT set
+            // TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF.
+            let flags = if self.comp_left > 0 {
+                inflate_flags::TINFL_FLAG_HAS_MORE_INPUT
+            } else {
+                0
+            };
+
+            let old_out_pos = self.out_pos;
+            let (status, consumed, produced) = decompress(
+                decomp,
+                &self.rbuf[..self.in_avail],
+                &mut self.window,
+                self.out_pos,
+                flags,
+            );
+
+            // Feed new output to HTML stripper; always contiguous
+            // within window.
+            if produced > 0 {
+                let end = old_out_pos + produced;
+                debug_assert!(
+                    end <= WINDOW_SIZE,
+                    "deflate produced past window boundary: {} > {}",
+                    end,
+                    WINDOW_SIZE
+                );
+
+                feed_and_flush(
+                    &mut self.stripper,
+                    &self.window[old_out_pos..end],
+                    &mut self.strip_buf,
+                    &mut self.strip_pos,
+                    &mut self.total_written,
+                    output_fn,
+                )?;
+            }
+
+            self.out_pos += produced;
+
+            if consumed > 0 && consumed < self.in_avail {
+                self.rbuf.copy_within(consumed..self.in_avail, 0);
+            }
+            self.in_avail -= consumed;
+
+            match status {
+                TINFLStatus::Done => {
+                    // Flush trailing stripper state.
+                    let trailing =
+                        self.stripper.finish(&mut self.strip_buf[self.strip_pos..]);
+                    self.strip_pos += trailing;
+                    if self.strip_pos > 0 {
+                        output_fn(&self.strip_buf[..self.strip_pos])?;
+                        self.total_written += self.strip_pos as u32;
+                        self.strip_pos = 0;
+                    }
+                    self.done = true;
+                    return Ok(StripStepResult::Done(self.total_written));
+                }
+
+                TINFLStatus::HasMoreOutput => {
+                    // Window full; reset write pos, data stays for
+                    // back-references.
+                    self.out_pos = 0;
+                }
+
+                TINFLStatus::NeedsMoreInput => {
+                    if self.comp_left == 0 && self.in_avail == 0 {
+                        return Err("cache: truncated deflate stream");
+                    }
+                    if consumed == 0
+                        && produced == 0
+                        && self.in_avail >= READ_BUF_SIZE
+                    {
+                        return Err("cache: deflate stream stuck");
+                    }
+                }
+
+                _ => return Err("cache: deflate decompression error"),
+            }
+        }
+
+        // Exhausted iteration budget — yield back to caller.
+        Ok(StripStepResult::Continue)
+    }
+}
+
 // feed input through stripper; flush to output_fn when FLUSH_THRESHOLD reached
 fn feed_and_flush(
     stripper: &mut HtmlStripStream,
