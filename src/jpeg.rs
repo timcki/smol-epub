@@ -4,8 +4,10 @@
 //! Luminance (Y) channel only — chrominance is Huffman-decoded to
 //! advance the bitstream, then discarded.
 //!
-//! Progressive JPEG (SOF2) is partially supported: first scan only
-//! (DC + low-frequency AC).
+//! Progressive JPEG (SOF2) is rejected at decode time: multi-scan
+//! progressive entropy streams cannot be reconstructed correctly
+//! from a first-scan-only pass, so the decoder bails with a clear
+//! error rather than producing degraded or corrupted output.
 //!
 //! Output is packed 1-bit MSB-first, row-major — see [`DecodedImage`](crate::DecodedImage).
 
@@ -33,9 +35,6 @@ const M_RST7: u8 = 0xD7;
 
 const MAX_COMP: usize = 4;
 const MAX_PIXELS: u32 = 2048 * 2048;
-
-// header bytes to read for marker parsing; large APP/EXIF segments skipped by length
-const HEADER_READ: usize = 49152; // 48 KB — enough for JPEGs with large EXIF/XMP APP segments
 
 // chunk size for streaming reads during MCU decode
 const CHUNK_SIZE: usize = 4096;
@@ -108,8 +107,6 @@ struct JpegState {
     dc_ok: [bool; 4],
     ac_ok: [bool; 4],
     restart_interval: u16,
-    // byte offset of entropy data (relative to start of JPEG data)
-    scan_start: usize,
     scan_num_comp: u8,
     scan_order: [u8; MAX_COMP],
     progressive: bool,
@@ -140,21 +137,29 @@ impl JpegState {
 
 // byte source trait + implementations
 
-// raw byte source for the JPEG bitstream
-trait JpegRead {
+/// Byte-at-a-time JPEG byte source.
+///
+/// Used by [`decode_jpeg`] and [`peek_jpeg_dimensions`] to abstract
+/// over in-memory slices, SD-backed chunked reads, and DEFLATE-decompressed
+/// streams. Returning `Err` from `read_byte` is treated as an unexpected
+/// EOF / I/O failure.
+pub trait JpegRead {
+    /// Read the next byte, or return an error on EOF / I/O failure.
     fn read_byte(&mut self) -> Result<u8, &'static str>;
+    /// True when no more bytes are available from the source.
     fn is_eof(&self) -> bool;
 }
 
-// reads from an in-memory slice
-struct SliceReader<'a> {
+/// [`JpegRead`] backed by an in-memory slice.
+pub struct SliceReader<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> SliceReader<'a> {
-    fn new(data: &'a [u8], start: usize) -> Self {
-        Self { data, pos: start }
+    /// Construct a reader over `data` starting at byte 0.
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
     }
 }
 
@@ -175,8 +180,12 @@ impl JpegRead for SliceReader<'_> {
     }
 }
 
-// reads from SD via closure, buffering 4KB chunks
-struct ChunkReader<F> {
+/// [`JpegRead`] backed by a chunked random-access source (typically SD).
+///
+/// `read_fn(offset, buf)` is invoked to fill an internal 4 KB buffer
+/// on demand; per-byte reads are served from that buffer. `start..end`
+/// bounds the byte range available from the source.
+pub struct ChunkReader<F> {
     read_fn: F,
     offset: u32, // absolute offset of next byte to fetch
     end: u32,    // end-of-data offset (exclusive)
@@ -186,7 +195,8 @@ struct ChunkReader<F> {
 }
 
 impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> ChunkReader<F> {
-    fn new(read_fn: F, start: u32, end: u32) -> Self {
+    /// Construct a reader covering bytes `[start, end)` of the source.
+    pub fn new(read_fn: F, start: u32, end: u32) -> Self {
         Self {
             read_fn,
             offset: start,
@@ -233,9 +243,13 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> JpegRead for Chunk
     }
 }
 
-// streaming DEFLATE-from-SD reader; 4KB chunks in, one decompressed byte at a time out.
-// peak heap: ~47KB (11KB decompressor + 32KB window + 4KB read buf).
-struct DeflateReader<F> {
+/// Streaming DEFLATE-from-source [`JpegRead`].
+///
+/// Decompresses a ZIP-stored DEFLATE blob on the fly, holding only a
+/// 32 KB sliding window plus the miniz decompressor state (~47 KB peak).
+/// Use this to decode JPEGs from `METHOD_DEFLATED` ZIP entries without
+/// materialising the entire decompressed payload in memory.
+pub struct DeflateReader<F> {
     read_fn: F,
     file_pos: u32,    // absolute offset of next compressed byte
     comp_left: usize, // compressed bytes remaining in ZIP entry
@@ -250,7 +264,9 @@ struct DeflateReader<F> {
 }
 
 impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
-    fn new(read_fn: F, data_offset: u32, comp_size: u32) -> Result<Self, &'static str> {
+    /// Construct a reader over a DEFLATE-compressed blob at `data_offset`
+    /// in the source, with `comp_size` compressed bytes available.
+    pub fn new(read_fn: F, data_offset: u32, comp_size: u32) -> Result<Self, &'static str> {
         use miniz_oxide::inflate::core::DecompressorOxide;
 
         let decomp_ptr =
@@ -347,30 +363,6 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
         }
 
         Ok(())
-    }
-
-    // read up to buf.len() decompressed bytes into buf; return count read
-    fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let mut total = 0usize;
-        while total < buf.len() {
-            if self.avail == 0 {
-                if self.done {
-                    break;
-                }
-                self.pump()?;
-                if self.avail == 0 {
-                    break;
-                }
-            }
-            let rp = self.read_pos & (DEFLATE_WINDOW - 1);
-            let contiguous = (DEFLATE_WINDOW - rp).min(self.avail);
-            let n = contiguous.min(buf.len() - total);
-            buf[total..total + n].copy_from_slice(&self.window[rp..rp + n]);
-            self.read_pos += n;
-            self.avail -= n;
-            total += n;
-        }
-        Ok(total)
     }
 }
 
@@ -517,249 +509,31 @@ impl<R: JpegRead> BitReader<R> {
 
 // public API
 
-// decode a baseline JPEG from an in-memory buffer
-/// Decode a JPEG from an in-memory buffer to a 1-bit dithered bitmap.
+/// Decode a JPEG to a 1-bit dithered bitmap from any [`JpegRead`].
 ///
 /// The image is integer-downscaled so the result fits within
-/// `max_w` × `max_h` pixels.
-pub fn decode_jpeg_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedImage, &'static str> {
-    let st = parse_markers(data)?;
-
+/// `max_w` × `max_h` pixels. Progressive JPEGs (SOF2) are rejected.
+///
+/// The reader is consumed; on success, all bytes up to (but not
+/// necessarily including) the EOI have been read from the source.
+pub fn decode_jpeg<R: JpegRead>(
+    mut reader: R,
+    max_w: u16,
+    max_h: u16,
+) -> Result<DecodedImage, &'static str> {
+    let st = parse_markers(&mut reader)?;
     validate_tables(&st)?;
-
-    let reader = SliceReader::new(data, st.scan_start);
     decode_baseline(&st, BitReader::new(reader), max_w, max_h)
 }
 
-/// Decode a JPEG from a **stored** (uncompressed) ZIP entry by streaming
-/// 4 KB chunks through `read_fn`.
+/// Read the dimensions of a JPEG without performing a full decode.
 ///
-/// `read_fn(offset, buf)` reads bytes at the given absolute offset and
-/// returns the number of bytes actually read. Progressive JPEGs are
-/// decoded using the first scan only.
-pub fn decode_jpeg_streaming<F>(
-    mut read_fn: F,
-    data_offset: u32,
-    data_size: u32,
-    max_w: u16,
-    max_h: u16,
-) -> Result<DecodedImage, &'static str>
-where
-    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
-{
-    // read the first portion of the JPEG for marker parsing
-    let hdr_size = HEADER_READ.min(data_size as usize);
-    let mut hdr = Vec::new();
-    hdr.try_reserve_exact(hdr_size)
-        .map_err(|_| "jpeg: OOM for header")?;
-    hdr.resize(hdr_size, 0);
-    let n = read_fn(data_offset, &mut hdr)?;
-    hdr.truncate(n);
-
-    let st = parse_markers(&hdr)?;
-
-    validate_tables(&st)?;
-
-    // free header; marker data is now in JpegState
-    drop(hdr);
-
-    let scan_abs = data_offset + st.scan_start as u32;
-    let end_abs = data_offset + data_size;
-    let reader = ChunkReader::new(read_fn, scan_abs, end_abs);
-
-    decode_baseline(&st, BitReader::new(reader), max_w, max_h)
-}
-
-/// Backward-compatible alias for [`decode_jpeg_streaming`].
-pub fn decode_jpeg_sd<F>(
-    read_fn: F,
-    data_offset: u32,
-    data_size: u32,
-    max_w: u16,
-    max_h: u16,
-) -> Result<DecodedImage, &'static str>
-where
-    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
-{
-    decode_jpeg_streaming(read_fn, data_offset, data_size, max_w, max_h)
-}
-
-/// Decode a JPEG from a **DEFLATE-compressed** ZIP entry by streaming
-/// reads through `read_fn`.
-///
-/// Both ZIP decompression and MCU decode are streamed concurrently,
-/// so the full entry is never held in memory. Peak heap ≈ 79 KB.
-pub fn decode_jpeg_deflate_streaming<F>(
-    read_fn: F,
-    data_offset: u32,
-    comp_size: u32,
-    uncomp_size: u32,
-    max_w: u16,
-    max_h: u16,
-) -> Result<DecodedImage, &'static str>
-where
-    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
-{
-    let mut deflate = DeflateReader::new(read_fn, data_offset, comp_size)?;
-
-    // decompress enough for marker parsing
-    let hdr_size = HEADER_READ.min(uncomp_size as usize);
-    let mut hdr = Vec::new();
-    hdr.try_reserve_exact(hdr_size)
-        .map_err(|_| "jpeg: OOM for header")?;
-    hdr.resize(hdr_size, 0);
-    let n = deflate.read_bytes(&mut hdr)?;
-    hdr.truncate(n);
-
-    let st = parse_markers(&hdr)?;
-
-    validate_tables(&st)?;
-
-    // advance past header bytes already decompressed beyond scan_start;
-    // if scan_start > n skip forward; if <= n rewind read cursor
-    let scan_start = st.scan_start;
-    if scan_start > n {
-        // rare: headers larger than HEADER_READ; skip forward
-        let skip = scan_start - n;
-        let mut trash = [0u8; 256];
-        let mut left = skip;
-        while left > 0 {
-            let chunk = left.min(trash.len());
-            let got = deflate.read_bytes(&mut trash[..chunk])?;
-            if got == 0 {
-                return Err("jpeg: truncated DEFLATE before scan data");
-            }
-            left -= got;
-        }
-    } else {
-        // bytes from scan_start..n already in window; rewind read cursor
-        let rewind = n - scan_start;
-        deflate.read_pos -= rewind;
-        deflate.avail += rewind;
-    }
-
-    // free header; marker data is in JpegState
-    drop(hdr);
-
-    decode_baseline(&st, BitReader::new(deflate), max_w, max_h)
-}
-
-/// Backward-compatible alias for [`decode_jpeg_deflate_streaming`].
-pub fn decode_jpeg_deflate_sd<F>(
-    read_fn: F,
-    data_offset: u32,
-    comp_size: u32,
-    uncomp_size: u32,
-    max_w: u16,
-    max_h: u16,
-) -> Result<DecodedImage, &'static str>
-where
-    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
-{
-    decode_jpeg_deflate_streaming(read_fn, data_offset, comp_size, uncomp_size, max_w, max_h)
-}
-
-// ── dimension peek (no decode) ─────────────────────────────────────
-
-/// Read the dimensions of a JPEG from an in-memory buffer without decoding.
-///
-/// Scans markers until SOF0/SOF2 and returns `(width, height)` in source
-/// pixels.  No heap allocation — only a linear scan of the header bytes.
-pub fn peek_jpeg_dimensions(data: &[u8]) -> Result<(u16, u16), &'static str> {
-    scan_sof_dimensions(data)
-}
-
-/// Read the dimensions of a JPEG from a **stored** (uncompressed) ZIP entry
-/// by streaming reads via `read_fn`.
-///
-/// Reads up to 32 KB of header data (enough to skip past EXIF/APP segments
-/// and reach the SOF marker), then scans for SOF0/SOF2 to extract
-/// `(width, height)`.  The header buffer is heap-allocated but no decoder
-/// state (~4.5 KB) is created.
-pub fn peek_jpeg_dimensions_streaming<F>(
-    mut read_fn: F,
-    data_offset: u32,
-    data_size: u32,
-) -> Result<(u16, u16), &'static str>
-where
-    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
-{
-    let hdr_size = HEADER_READ.min(data_size as usize);
-    let mut hdr = Vec::new();
-    hdr.try_reserve_exact(hdr_size)
-        .map_err(|_| "jpeg: OOM for header peek")?;
-    hdr.resize(hdr_size, 0);
-    let n = read_fn(data_offset, &mut hdr)?;
-    hdr.truncate(n);
-    scan_sof_dimensions(&hdr)
-}
-
-/// Lightweight SOF scanner: finds the first SOF0 (0xC0) or SOF2 (0xC2)
-/// marker and extracts (width, height) without building full decoder state.
-fn scan_sof_dimensions(data: &[u8]) -> Result<(u16, u16), &'static str> {
-    if data.len() < 2 || data[0] != 0xFF || data[1] != M_SOI {
-        return Err("jpeg: invalid signature");
-    }
-    let mut pos = 2usize;
-    let len = data.len();
-
-    loop {
-        // skip to next 0xFF
-        while pos < len && data[pos] != 0xFF {
-            pos += 1;
-        }
-        // skip padding 0xFF bytes
-        while pos < len && data[pos] == 0xFF {
-            pos += 1;
-        }
-        if pos >= len {
-            return Err("jpeg: truncated (no SOF found)");
-        }
-        let marker = data[pos];
-        pos += 1;
-
-        match marker {
-            0x00 | M_RST0..=M_RST7 => continue,
-            M_SOF0 | M_SOF2 => {
-                // SOF segment: 2-byte length, 1-byte precision, 2-byte height, 2-byte width
-                if pos + 2 + 5 > len {
-                    return Err("jpeg: SOF truncated");
-                }
-                // skip segment length
-                let p = pos + 2;
-                // data[p] = precision (must be 8)
-                let height = be_u16(data, p + 1);
-                let width = be_u16(data, p + 3);
-                if width == 0 || height == 0 {
-                    return Err("jpeg: zero dimensions");
-                }
-                return Ok((width, height));
-            }
-            // unsupported SOF variants
-            0xC1 | 0xC3 | 0xC5..=0xCB | 0xCD..=0xCF => {
-                return Err("jpeg: unsupported SOF variant");
-            }
-            M_SOS => return Err("jpeg: SOS before SOF"),
-            M_EOI => return Err("jpeg: EOI before SOF"),
-            _ => {
-                // skip unknown marker by its 2-byte length field
-                if pos + 2 > len {
-                    return Err("jpeg: truncated marker");
-                }
-                let seg = be_u16(data, pos) as usize;
-                if seg < 2 {
-                    return Err("jpeg: bad marker length");
-                }
-                if pos + seg > len {
-                    // segment extends past header buffer (large EXIF/XMP);
-                    // skip to end and let the loop report "truncated"
-                    pos = len;
-                } else {
-                    pos += seg;
-                }
-            }
-        }
-    }
+/// Scans markers until SOF0 / SOF2 and returns `(width, height)` in
+/// source pixels.
+pub fn peek_jpeg_dimensions<R: JpegRead>(
+    mut reader: R,
+) -> Result<(u16, u16), &'static str> {
+    scan_sof_streaming(&mut reader)
 }
 
 // ── baseline decode core (generic over byte source) ────────────────
@@ -787,6 +561,14 @@ fn decode_baseline<R: JpegRead>(
     max_w: u16,
     max_h: u16,
 ) -> Result<DecodedImage, &'static str> {
+    if st.progressive {
+        // multi-scan progressive entropy streams (typical: DC-only first
+        // scan, then several AC partial scans, then refinement scans)
+        // cannot be reconstructed correctly from a single first-scan pass.
+        // bail cleanly so callers fall back to alt text instead of caching
+        // a corrupted preview.
+        return Err("jpeg: progressive JPEG not supported");
+    }
     let w = st.width as usize;
     let h = st.height as usize;
     if w == 0 || h == 0 {
@@ -811,28 +593,14 @@ fn decode_baseline<R: JpegRead>(
     let mcus_y = (h + mcu_h - 1) / mcu_h;
     let row_w = mcus_x * mcu_w;
 
-    if st.progressive {
-        log::warn!(
-            "jpeg: progressive {}x{} -> {}x{} (scale {}, first scan Ss={} Se={} Al={})",
-            w,
-            h,
-            out_w,
-            out_h,
-            scale,
-            st.scan_ss,
-            st.scan_se,
-            st.scan_al
-        );
-    } else {
-        log::info!(
-            "jpeg: baseline {}x{} → {}x{} (scale {})",
-            w,
-            h,
-            out_w,
-            out_h,
-            scale
-        );
-    }
+    log::info!(
+        "jpeg: baseline {}x{} → {}x{} (scale {})",
+        w,
+        h,
+        out_w,
+        out_h,
+        scale
+    );
 
     // allocate buffers
 
@@ -952,225 +720,230 @@ fn decode_baseline<R: JpegRead>(
     })
 }
 
-// marker parsing (operates on &[u8] header buffer)
+// streaming marker parsing — reads byte-by-byte from any JpegRead
 
-fn parse_markers(data: &[u8]) -> Result<Box<JpegState>, &'static str> {
-    if data.len() < 2 || data[0] != 0xFF || data[1] != M_SOI {
-        return Err("jpeg: invalid signature");
+#[inline]
+fn read_u16_be<R: JpegRead>(r: &mut R) -> Result<u16, &'static str> {
+    let hi = r.read_byte()? as u16;
+    let lo = r.read_byte()? as u16;
+    Ok((hi << 8) | lo)
+}
+
+fn skip_bytes<R: JpegRead>(r: &mut R, n: usize) -> Result<(), &'static str> {
+    for _ in 0..n {
+        r.read_byte()?;
     }
-    let mut st = JpegState::heap_new()?;
-    let mut pos = 2usize;
-    let len = data.len();
+    Ok(())
+}
 
+// walk to the next 0xFF, skip fill 0xFFs, return the marker code.
+fn next_marker<R: JpegRead>(r: &mut R) -> Result<u8, &'static str> {
     loop {
-        while pos < len && data[pos] != 0xFF {
-            pos += 1;
+        if r.read_byte()? == 0xFF {
+            break;
         }
-        while pos < len && data[pos] == 0xFF {
-            pos += 1;
-        }
-        if pos >= len {
-            return Err("jpeg: truncated");
-        }
-        let marker = data[pos];
-        pos += 1;
-
-        match marker {
-            0x00 | M_RST0..=M_RST7 => continue,
-
-            M_SOF0 => parse_sof(data, &mut pos, &mut st, false)?,
-            M_SOF2 => parse_sof(data, &mut pos, &mut st, true)?,
-            0xC1 | 0xC3 | 0xC5..=0xCB | 0xCD..=0xCF => {
-                return Err("jpeg: unsupported SOF variant");
-            }
-            M_DHT => parse_dht(data, &mut pos, &mut st)?,
-            M_DQT => parse_dqt(data, &mut pos, &mut st)?,
-            M_DRI => parse_dri(data, &mut pos, &mut st)?,
-            M_SOS => {
-                parse_sos(data, &mut pos, &mut st)?;
-                st.scan_start = pos;
-                return Ok(st);
-            }
-            M_EOI => return Err("jpeg: EOI before SOS"),
-            _ => {
-                if pos + 2 > len {
-                    return Err("jpeg: truncated marker");
-                }
-                let seg = be_u16(data, pos) as usize;
-                if seg < 2 {
-                    return Err("jpeg: bad marker length");
-                }
-                if pos + seg > len {
-                    // segment extends past header buffer (e.g. large EXIF);
-                    // skip to end — the markers we need (SOF/DQT/DHT/SOS)
-                    // come after this segment and will be found once
-                    // HEADER_READ is large enough, or we'll hit "truncated"
-                    pos = len;
-                } else {
-                    pos += seg;
-                }
-            }
+    }
+    loop {
+        let b = r.read_byte()?;
+        if b != 0xFF {
+            return Ok(b);
         }
     }
 }
 
-fn parse_sof(
-    data: &[u8],
-    pos: &mut usize,
+fn skip_unknown_marker<R: JpegRead>(r: &mut R) -> Result<(), &'static str> {
+    let seg = read_u16_be(r)? as usize;
+    if seg < 2 {
+        return Err("jpeg: bad marker length");
+    }
+    skip_bytes(r, seg - 2)
+}
+
+fn parse_markers<R: JpegRead>(r: &mut R) -> Result<Box<JpegState>, &'static str> {
+    // explicit signature check; map read errors to "invalid signature"
+    // so a truncated input reports the same error as a wrong magic.
+    let b1 = r.read_byte().map_err(|_| "jpeg: invalid signature")?;
+    let b2 = r.read_byte().map_err(|_| "jpeg: invalid signature")?;
+    if b1 != 0xFF || b2 != M_SOI {
+        return Err("jpeg: invalid signature");
+    }
+    let mut st = JpegState::heap_new()?;
+    loop {
+        let marker = next_marker(r)?;
+        match marker {
+            0x00 | M_RST0..=M_RST7 => continue,
+            M_SOF0 => parse_sof(r, &mut st, false)?,
+            M_SOF2 => parse_sof(r, &mut st, true)?,
+            // unsupported SOF variants: 1, 3, 5..=11, 13..=15
+            0xC1 | 0xC3 | 0xC5..=0xCB | 0xCD..=0xCF => {
+                return Err("jpeg: unsupported SOF variant");
+            }
+            M_DHT => parse_dht(r, &mut st)?,
+            M_DQT => parse_dqt(r, &mut st)?,
+            M_DRI => parse_dri(r, &mut st)?,
+            M_SOS => {
+                parse_sos(r, &mut st)?;
+                return Ok(st);
+            }
+            M_EOI => return Err("jpeg: EOI before SOS"),
+            _ => skip_unknown_marker(r)?,
+        }
+    }
+}
+
+fn parse_sof<R: JpegRead>(
+    r: &mut R,
     st: &mut JpegState,
     progressive: bool,
 ) -> Result<(), &'static str> {
-    if *pos + 2 > data.len() {
+    let seg = read_u16_be(r)? as usize;
+    if seg < 2 + 6 {
         return Err("jpeg: SOF truncated");
     }
-    let seg = be_u16(data, *pos) as usize;
-    *pos += 2;
-    if *pos + seg - 2 > data.len() {
-        return Err("jpeg: SOF truncated");
-    }
-    let p = *pos;
-    if data[p] != 8 {
+    let inner = seg - 2;
+
+    let prec = r.read_byte()?;
+    if prec != 8 {
         return Err("jpeg: only 8-bit precision");
     }
-    st.height = be_u16(data, p + 1);
-    st.width = be_u16(data, p + 3);
-    st.num_comp = data[p + 5];
+    st.height = read_u16_be(r)?;
+    st.width = read_u16_be(r)?;
+    let nc = r.read_byte()?;
+    st.num_comp = nc;
     st.progressive = progressive;
-    if st.num_comp == 0 || st.num_comp as usize > MAX_COMP {
+    if nc == 0 || nc as usize > MAX_COMP {
         return Err("jpeg: bad component count");
     }
-    if p + 6 + st.num_comp as usize * 3 > data.len() {
+    let need = 6 + nc as usize * 3;
+    if inner < need {
         return Err("jpeg: SOF truncated");
     }
-    let mut off = p + 6;
+
     st.max_h = 1;
     st.max_v = 1;
-    for i in 0..st.num_comp as usize {
-        st.comp[i].id = data[off];
-        let samp = data[off + 1];
+    for i in 0..nc as usize {
+        st.comp[i].id = r.read_byte()?;
+        let samp = r.read_byte()?;
         st.comp[i].h_samp = samp >> 4;
         st.comp[i].v_samp = samp & 0x0F;
-        st.comp[i].qt_idx = data[off + 2];
+        st.comp[i].qt_idx = r.read_byte()?;
         if st.comp[i].h_samp == 0 || st.comp[i].v_samp == 0 {
             return Err("jpeg: zero sampling factor");
         }
         st.max_h = st.max_h.max(st.comp[i].h_samp);
         st.max_v = st.max_v.max(st.comp[i].v_samp);
-        off += 3;
     }
-    *pos += seg - 2;
-    Ok(())
+    skip_bytes(r, inner - need)
 }
 
-fn parse_dqt(data: &[u8], pos: &mut usize, st: &mut JpegState) -> Result<(), &'static str> {
-    if *pos + 2 > data.len() {
+fn parse_dqt<R: JpegRead>(r: &mut R, st: &mut JpegState) -> Result<(), &'static str> {
+    let seg = read_u16_be(r)? as usize;
+    if seg < 2 {
         return Err("jpeg: DQT truncated");
     }
-    let seg = be_u16(data, *pos) as usize;
-    let end = *pos + seg;
-    *pos += 2;
-    if end > data.len() {
-        return Err("jpeg: DQT truncated");
-    }
-    while *pos < end {
-        let info = data[*pos];
-        *pos += 1;
+    let mut left = seg - 2;
+    while left > 0 {
+        if left < 1 {
+            return Err("jpeg: DQT truncated");
+        }
+        let info = r.read_byte()?;
+        left -= 1;
         let prec = info >> 4;
         let id = (info & 0x0F) as usize;
         if id >= 4 {
             return Err("jpeg: DQT id out of range");
         }
         if prec == 0 {
-            if *pos + 64 > end {
+            if left < 64 {
                 return Err("jpeg: DQT truncated");
             }
             for i in 0..64 {
-                st.qt[id][i] = data[*pos] as u16;
-                *pos += 1;
+                st.qt[id][i] = r.read_byte()? as u16;
             }
+            left -= 64;
         } else {
-            if *pos + 128 > end {
+            if left < 128 {
                 return Err("jpeg: DQT truncated");
             }
             for i in 0..64 {
-                st.qt[id][i] = be_u16(data, *pos);
-                *pos += 2;
+                st.qt[id][i] = read_u16_be(r)?;
             }
+            left -= 128;
         }
         st.qt_ok[id] = true;
     }
     Ok(())
 }
 
-fn parse_dht(data: &[u8], pos: &mut usize, st: &mut JpegState) -> Result<(), &'static str> {
-    if *pos + 2 > data.len() {
+fn parse_dht<R: JpegRead>(r: &mut R, st: &mut JpegState) -> Result<(), &'static str> {
+    let seg = read_u16_be(r)? as usize;
+    if seg < 2 {
         return Err("jpeg: DHT truncated");
     }
-    let seg = be_u16(data, *pos) as usize;
-    let end = *pos + seg;
-    *pos += 2;
-    if end > data.len() {
-        return Err("jpeg: DHT truncated");
-    }
-    while *pos < end {
-        if *pos + 17 > end {
+    let mut left = seg - 2;
+    while left > 0 {
+        if left < 17 {
             return Err("jpeg: DHT truncated");
         }
-        let info = data[*pos];
-        *pos += 1;
+        let info = r.read_byte()?;
         let class = info >> 4;
         let id = (info & 0x0F) as usize;
         if id >= 4 {
             return Err("jpeg: DHT id out of range");
         }
         let mut bits = [0u8; 16];
-        bits.copy_from_slice(&data[*pos..*pos + 16]);
-        *pos += 16;
+        for b in bits.iter_mut() {
+            *b = r.read_byte()?;
+        }
         let total: usize = bits.iter().map(|&b| b as usize).sum();
-        if total > 256 || *pos + total > end {
+        if total > 256 || left < 17 + total {
             return Err("jpeg: DHT value overflow");
         }
-        let vals = &data[*pos..*pos + total];
-        *pos += total;
+        let mut vals = [0u8; 256];
+        for v in vals.iter_mut().take(total) {
+            *v = r.read_byte()?;
+        }
         if class == 0 {
-            build_huff_table(&mut st.dc_huff[id], &bits, vals);
+            build_huff_table(&mut st.dc_huff[id], &bits, &vals[..total]);
             st.dc_ok[id] = true;
         } else {
-            build_huff_table(&mut st.ac_huff[id], &bits, vals);
+            build_huff_table(&mut st.ac_huff[id], &bits, &vals[..total]);
             st.ac_ok[id] = true;
         }
+        left -= 17 + total;
     }
     Ok(())
 }
 
-fn parse_dri(data: &[u8], pos: &mut usize, st: &mut JpegState) -> Result<(), &'static str> {
-    if *pos + 4 > data.len() {
+fn parse_dri<R: JpegRead>(r: &mut R, st: &mut JpegState) -> Result<(), &'static str> {
+    let seg = read_u16_be(r)? as usize;
+    if seg < 4 {
         return Err("jpeg: DRI truncated");
     }
-    *pos += 2;
-    st.restart_interval = be_u16(data, *pos);
-    *pos += 2;
-    Ok(())
+    st.restart_interval = read_u16_be(r)?;
+    skip_bytes(r, seg - 4)
 }
 
-fn parse_sos(data: &[u8], pos: &mut usize, st: &mut JpegState) -> Result<(), &'static str> {
-    if *pos + 2 > data.len() {
+fn parse_sos<R: JpegRead>(r: &mut R, st: &mut JpegState) -> Result<(), &'static str> {
+    let seg = read_u16_be(r)? as usize;
+    if seg < 2 + 4 {
         return Err("jpeg: SOS truncated");
     }
-    let seg = be_u16(data, *pos) as usize;
-    if *pos + seg > data.len() {
-        return Err("jpeg: SOS truncated");
-    }
-    *pos += 2;
-    st.scan_num_comp = data[*pos];
-    *pos += 1;
-    if st.scan_num_comp == 0 || st.scan_num_comp > st.num_comp {
+    let inner = seg - 2;
+
+    let nc = r.read_byte()?;
+    st.scan_num_comp = nc;
+    if nc == 0 || nc > st.num_comp {
         return Err("jpeg: bad SOS component count");
     }
-    for sci in 0..st.scan_num_comp as usize {
-        let cs = data[*pos];
-        let td_ta = data[*pos + 1];
-        *pos += 2;
+    let need = 1 + nc as usize * 2 + 3;
+    if inner < need {
+        return Err("jpeg: SOS truncated");
+    }
+
+    for sci in 0..nc as usize {
+        let cs = r.read_byte()?;
+        let td_ta = r.read_byte()?;
         let mut found = false;
         for j in 0..st.num_comp as usize {
             if st.comp[j].id == cs {
@@ -1185,12 +958,50 @@ fn parse_sos(data: &[u8], pos: &mut usize, st: &mut JpegState) -> Result<(), &'s
             return Err("jpeg: SOS references unknown component");
         }
     }
-    st.scan_ss = data[*pos].min(63);
-    st.scan_se = data[*pos + 1].min(63);
-    let ah_al = data[*pos + 2];
+    st.scan_ss = r.read_byte()?.min(63);
+    st.scan_se = r.read_byte()?.min(63);
+    let ah_al = r.read_byte()?;
     st.scan_al = ah_al & 0x0F;
-    *pos += 3;
-    Ok(())
+
+    skip_bytes(r, inner - need)
+}
+
+// finds the first SOF0/SOF2 marker and returns (width, height) without
+// building full decoder state.
+fn scan_sof_streaming<R: JpegRead>(r: &mut R) -> Result<(u16, u16), &'static str> {
+    let b1 = r.read_byte().map_err(|_| "jpeg: invalid signature")?;
+    let b2 = r.read_byte().map_err(|_| "jpeg: invalid signature")?;
+    if b1 != 0xFF || b2 != M_SOI {
+        return Err("jpeg: invalid signature");
+    }
+    loop {
+        let marker = next_marker(r)?;
+        match marker {
+            0x00 | M_RST0..=M_RST7 => continue,
+            M_SOF0 | M_SOF2 => {
+                let seg = read_u16_be(r)? as usize;
+                if seg < 2 + 5 {
+                    return Err("jpeg: SOF truncated");
+                }
+                let prec = r.read_byte()?;
+                if prec != 8 {
+                    return Err("jpeg: only 8-bit precision");
+                }
+                let height = read_u16_be(r)?;
+                let width = read_u16_be(r)?;
+                if width == 0 || height == 0 {
+                    return Err("jpeg: zero dimensions");
+                }
+                return Ok((width, height));
+            }
+            0xC1 | 0xC3 | 0xC5..=0xCB | 0xCD..=0xCF => {
+                return Err("jpeg: unsupported SOF variant");
+            }
+            M_SOS => return Err("jpeg: SOS before SOF"),
+            M_EOI => return Err("jpeg: EOI before SOF"),
+            _ => skip_unknown_marker(r)?,
+        }
+    }
 }
 
 // Huffman table construction
@@ -1485,9 +1296,4 @@ fn descale(x: i32, n: i32) -> i32 {
 #[inline]
 fn clamp(x: i32) -> u8 {
     x.clamp(0, 255) as u8
-}
-
-#[inline]
-fn be_u16(d: &[u8], o: usize) -> u16 {
-    u16::from_be_bytes([d[o], d[o + 1]])
 }
