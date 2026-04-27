@@ -114,7 +114,37 @@ const PENDING_CAP: usize = 32;
 // ALIGN_CENTER + H1_ON = 6 bytes; nested <li> bullet adds 4 UTF-8 bytes;
 // inline <b><i> add 4 more) so 32 is sized for the worst realistic stack.
 const DEFERRED_CAP: usize = 32;
-const IMG_SRC_CAP: usize = 128; // 3-byte marker header + up to 125 path bytes
+
+// img_src layout during <img> attribute capture:
+//   [0..9)                 reserved for the marker header, filled at finish
+//   [9..9+IMG_ALT_CAP)     alt-text buffer (img_alt_w bytes valid)
+//   [9+IMG_ALT_CAP..end)   path buffer (img_w bytes valid)
+// at finish, path is shifted left to follow alt and the header is written
+// in front, producing a single drainable [MARKER, IMG_REF, flags, w_lo,
+// w_hi, h_lo, h_hi, alt_len, path_len, alt..., path...] payload. The total
+// post-compaction length is at most IMG_SRC_CAP, which keeps img_w (u8)
+// usable as the drain cursor.
+const IMG_SRC_CAP: usize = 192;
+/// Length of the IMG_REF marker header (the bytes preceding alt + path):
+/// `[MARKER, IMG_REF, flags, w_lo, w_hi, h_lo, h_hi, alt_len, path_len]`.
+pub const IMG_HEADER_LEN: usize = 9;
+const IMG_ALT_CAP: usize = 48;
+const IMG_PATH_OFFSET: usize = IMG_HEADER_LEN + IMG_ALT_CAP;
+const IMG_PATH_CAP: usize = IMG_SRC_CAP - IMG_PATH_OFFSET;
+
+// IMG_REF flags byte (in the marker payload)
+const IMG_FLAG_FIGURE: u8 = 1 << 0; // image is the canonical content of a <figure>
+// reserved: explicit "force block" hint (e.g. from inline `display: block`)
+// not yet emitted by the stripper; the consumer keeps the bit reserved.
+#[allow(dead_code)]
+const IMG_FLAG_BLOCK: u8 = 1 << 1;
+
+// captured <img> attribute kinds
+const IMG_ATTR_NONE: u8 = 0;
+const IMG_ATTR_SRC: u8 = 1;
+const IMG_ATTR_ALT: u8 = 2;
+const IMG_ATTR_WIDTH: u8 = 3;
+const IMG_ATTR_HEIGHT: u8 = 4;
 
 // state machine phases
 #[derive(Clone, Copy, PartialEq)]
@@ -194,13 +224,19 @@ pub struct HtmlStripStream {
     pend_w: u8,
     pend_r: u8,
 
-    // image src capture (<img src="...">)
+    // image attribute capture (<img src=alt=width=height>)
     img_src: [u8; IMG_SRC_CAP],
-    img_w: u8,         // write cursor (accumulation at [3..]) / drain length
-    img_r: u8,         // drain read cursor
-    capture_img: bool, // true while inside <img> tag body
-    img_is_src: bool,  // current attribute name matched "src"
-    img_quote: u8,     // active quote char in attribute value
+    img_w: u8,           // path bytes written, relative to IMG_PATH_OFFSET
+    img_alt_w: u8,       // alt bytes written, relative to IMG_HEADER_LEN
+    img_r: u8,           // drain read cursor (after finish_img_tag)
+    img_w_attr: u16,     // <img width="..."> parsed pixels, 0 if absent
+    img_h_attr: u16,     // <img height="..."> parsed pixels, 0 if absent
+    img_num: u16,        // accumulated digits for width/height value
+    img_flags: u8,       // emitted as IMG_REF flags byte
+    img_attr_kind: u8,   // IMG_ATTR_NONE / SRC / ALT / WIDTH / HEIGHT
+    capture_img: bool,   // true while inside <img> tag body
+    img_quote: u8,       // active quote char in attribute value
+    in_figure: bool,     // currently between <figure> and </figure>
 }
 
 impl HtmlStripStream {
@@ -229,10 +265,16 @@ impl HtmlStripStream {
             pend_r: 0,
             img_src: [0u8; IMG_SRC_CAP],
             img_w: 0,
+            img_alt_w: 0,
             img_r: 0,
+            img_w_attr: 0,
+            img_h_attr: 0,
+            img_num: 0,
+            img_flags: 0,
+            img_attr_kind: IMG_ATTR_NONE,
             capture_img: false,
-            img_is_src: false,
             img_quote: 0,
+            in_figure: false,
         }
     }
 
@@ -376,8 +418,7 @@ impl HtmlStripStream {
 
                 Phase::ImgAttrName => {
                     if b == b'=' {
-                        let name = &self.tag_buf[..self.tag_len as usize];
-                        self.img_is_src = name == b"src";
+                        self.classify_img_attr();
                         self.phase = Phase::ImgValStart;
                     } else if b == b'>' {
                         self.finish_img_tag();
@@ -391,8 +432,7 @@ impl HtmlStripStream {
 
                 Phase::ImgAttrGap => {
                     if b == b'=' {
-                        let name = &self.tag_buf[..self.tag_len as usize];
-                        self.img_is_src = name == b"src";
+                        self.classify_img_attr();
                         self.phase = Phase::ImgValStart;
                     } else if b == b'>' {
                         self.finish_img_tag();
@@ -406,28 +446,17 @@ impl HtmlStripStream {
                 }
 
                 Phase::ImgValStart => {
+                    self.img_num = 0;
                     if b == b'"' || b == b'\'' {
                         self.img_quote = b;
-                        self.phase = if self.img_is_src {
-                            Phase::ImgSrcVal
-                        } else {
-                            Phase::ImgSkipVal
-                        };
+                        self.phase = next_img_val_phase(self.img_attr_kind);
                     } else if b == b'>' {
                         self.finish_img_tag();
                     } else if !is_html_ws(b) {
-                        // unquoted attribute value
+                        // unquoted attribute value: capture the first byte directly
                         self.img_quote = 0;
-                        if self.img_is_src {
-                            let pos = self.img_w as usize;
-                            if pos < IMG_SRC_CAP {
-                                self.img_src[pos] = b;
-                                self.img_w += 1;
-                            }
-                            self.phase = Phase::ImgSrcVal;
-                        } else {
-                            self.phase = Phase::ImgSkipVal;
-                        }
+                        self.phase = next_img_val_phase(self.img_attr_kind);
+                        self.capture_img_val_byte(b);
                     }
                 }
 
@@ -438,16 +467,14 @@ impl HtmlStripStream {
                         is_html_ws(b) || b == b'>' || b == b'/'
                     };
                     if done {
+                        self.commit_img_num();
+                        self.img_attr_kind = IMG_ATTR_NONE;
                         self.phase = Phase::ImgBody;
                         if self.img_quote == 0 && b == b'>' {
                             self.finish_img_tag();
                         }
                     } else {
-                        let pos = self.img_w as usize;
-                        if pos < IMG_SRC_CAP {
-                            self.img_src[pos] = b;
-                            self.img_w += 1;
-                        }
+                        self.capture_img_val_byte(b);
                     }
                 }
 
@@ -833,11 +860,21 @@ impl HtmlStripStream {
             self.push_deferred_marker(BREAK);
         }
 
-        // <img>: enter image-src capture mode
+        // <figure>: track depth so <img> inside marks itself as figure-content
+        if name == b"figure" {
+            self.in_figure = !is_close;
+        }
+
+        // <img>: enter image-attribute capture mode; reset accumulators
         if name == b"img" && !is_close {
             self.capture_img = true;
-            self.img_w = 3; // reserve [0..3] for marker header
-            self.img_is_src = false;
+            self.img_w = 0;
+            self.img_alt_w = 0;
+            self.img_w_attr = 0;
+            self.img_h_attr = 0;
+            self.img_num = 0;
+            self.img_attr_kind = IMG_ATTR_NONE;
+            self.img_flags = if self.in_figure { IMG_FLAG_FIGURE } else { 0 };
         }
     }
 
@@ -851,13 +888,108 @@ impl HtmlStripStream {
         }
     }
 
+    // identify the captured attribute name (in tag_buf) and update img_attr_kind.
+    // closes out any digit value pending from a previous attribute.
+    fn classify_img_attr(&mut self) {
+        // commit any in-flight numeric value before switching attribute
+        self.commit_img_num();
+        let name = &self.tag_buf[..self.tag_len as usize];
+        self.img_attr_kind = match name {
+            b"src" => IMG_ATTR_SRC,
+            b"alt" => IMG_ATTR_ALT,
+            b"width" => IMG_ATTR_WIDTH,
+            b"height" => IMG_ATTR_HEIGHT,
+            _ => IMG_ATTR_NONE,
+        };
+        self.img_num = 0;
+    }
+
+    // capture one byte of an attribute value. dispatches by `img_attr_kind`:
+    //   src   -> append to img_src path region (offset IMG_PATH_OFFSET..)
+    //   alt   -> append to img_src alt region (offset IMG_HEADER_LEN..)
+    //   w/h   -> accumulate ASCII digits into img_num; ignore other chars
+    //            so values like `width="80px"` keep the leading digits
+    fn capture_img_val_byte(&mut self, b: u8) {
+        match self.img_attr_kind {
+            IMG_ATTR_SRC => {
+                let pos = IMG_PATH_OFFSET + self.img_w as usize;
+                if (self.img_w as usize) < IMG_PATH_CAP {
+                    self.img_src[pos] = b;
+                    self.img_w += 1;
+                }
+            }
+            IMG_ATTR_ALT => {
+                // collapse runs of whitespace, drop leading whitespace, and
+                // skip the MARKER escape byte (cannot appear in payloads).
+                let alt_pos = self.img_alt_w as usize;
+                if b == MARKER {
+                    return;
+                }
+                let is_ws = is_html_ws(b);
+                if is_ws {
+                    if alt_pos == 0 {
+                        return;
+                    }
+                    if self.img_src[IMG_HEADER_LEN + alt_pos - 1] == b' ' {
+                        return;
+                    }
+                    if alt_pos < IMG_ALT_CAP {
+                        self.img_src[IMG_HEADER_LEN + alt_pos] = b' ';
+                        self.img_alt_w += 1;
+                    }
+                } else if alt_pos < IMG_ALT_CAP {
+                    self.img_src[IMG_HEADER_LEN + alt_pos] = b;
+                    self.img_alt_w += 1;
+                }
+            }
+            IMG_ATTR_WIDTH | IMG_ATTR_HEIGHT => {
+                if b.is_ascii_digit() {
+                    let n = self.img_num.saturating_mul(10);
+                    self.img_num = n.saturating_add((b - b'0') as u16);
+                }
+                // non-digit bytes (units, separators) are ignored
+            }
+            _ => {}
+        }
+    }
+
+    // finalise the in-flight numeric attribute value by writing it to the
+    // appropriate field. called when the attribute value ends (close quote
+    // or whitespace) and on every attribute boundary.
+    fn commit_img_num(&mut self) {
+        match self.img_attr_kind {
+            IMG_ATTR_WIDTH => self.img_w_attr = self.img_num,
+            IMG_ATTR_HEIGHT => self.img_h_attr = self.img_num,
+            _ => {}
+        }
+    }
+
+    // trim trailing ASCII whitespace from the captured alt-text region.
+    fn trim_img_alt_trailing_ws(&mut self) {
+        while self.img_alt_w > 0 {
+            let last_idx = IMG_HEADER_LEN + self.img_alt_w as usize - 1;
+            if self.img_src[last_idx] == b' ' {
+                self.img_alt_w -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
     // finish <img> tag; emit image-ref marker if src was captured
     fn finish_img_tag(&mut self) {
-        let path_len = (self.img_w as usize).saturating_sub(3);
+        // commit any in-flight numeric value (e.g. unquoted width="123")
+        self.commit_img_num();
+        // tidy up captured alt
+        self.trim_img_alt_trailing_ws();
+
+        let path_len = self.img_w as usize;
+        let alt_len = self.img_alt_w as usize;
         self.capture_img = false;
 
         if path_len > 0 {
-            // block break before image
+            // block break before image (image is treated as block-level until
+            // the consumer demotes it to inline based on dimensions)
             if self.has_output {
                 self.trailing_nl = self.trailing_nl.max(2);
             }
@@ -875,12 +1007,34 @@ impl HtmlStripStream {
                 self.push_pending(self.deferred[i]);
             }
             self.deferred_len = 0;
-            // fill marker header [MARKER, IMG_REF, path_len];
-            // path bytes already at img_src[3..3+path_len]
+
+            // compact: shift path bytes from IMG_PATH_OFFSET to IMG_HEADER_LEN
+            // + alt_len so they sit immediately after the alt buffer. then
+            // write the 9-byte header in front.
+            let path_dst = IMG_HEADER_LEN + alt_len;
+            if path_dst != IMG_PATH_OFFSET {
+                // copy_within handles overlap; src and dst don't alias here
+                // because path_dst < IMG_PATH_OFFSET (alt_len < IMG_ALT_CAP)
+                self.img_src.copy_within(
+                    IMG_PATH_OFFSET..IMG_PATH_OFFSET + path_len,
+                    path_dst,
+                );
+            }
+            let total_len = IMG_HEADER_LEN + alt_len + path_len;
+            // build header
             self.img_src[0] = MARKER;
             self.img_src[1] = IMG_REF;
-            self.img_src[2] = path_len as u8;
+            self.img_src[2] = self.img_flags;
+            self.img_src[3] = (self.img_w_attr & 0xFF) as u8;
+            self.img_src[4] = (self.img_w_attr >> 8) as u8;
+            self.img_src[5] = (self.img_h_attr & 0xFF) as u8;
+            self.img_src[6] = (self.img_h_attr >> 8) as u8;
+            self.img_src[7] = alt_len as u8;
+            self.img_src[8] = path_len as u8;
+
             self.img_r = 0;
+            self.img_w = total_len as u8;
+
             // block break after image
             self.trailing_nl = 2;
             self.last_was_space = true;
@@ -889,7 +1043,25 @@ impl HtmlStripStream {
             self.img_w = 0;
         }
 
+        // reset capture state for the next image
+        self.img_alt_w = 0;
+        self.img_w_attr = 0;
+        self.img_h_attr = 0;
+        self.img_num = 0;
+        self.img_flags = 0;
+        self.img_attr_kind = IMG_ATTR_NONE;
+
         self.phase = Phase::Text;
+    }
+}
+
+// pick the post-quote phase based on which attribute we captured. width and
+// height share the same accumulation phase as src and alt (`ImgSrcVal`); the
+// dispatch inside `capture_img_val_byte` decides what to do per byte.
+fn next_img_val_phase(kind: u8) -> Phase {
+    match kind {
+        IMG_ATTR_NONE => Phase::ImgSkipVal,
+        _ => Phase::ImgSrcVal,
     }
 }
 
@@ -1155,6 +1327,7 @@ fn open_style_tag(tag: &[u8]) -> Option<u8> {
         b"h5" => Some(H5_ON),
         b"h6" => Some(H6_ON),
         b"blockquote" => Some(QUOTE_ON),
+        b"figcaption" => Some(FIGCAPTION_ON),
         _ => None,
     }
 }
@@ -1172,6 +1345,7 @@ fn close_style_tag(tag: &[u8]) -> Option<u8> {
         b"h5" => Some(H5_OFF),
         b"h6" => Some(H6_OFF),
         b"blockquote" => Some(QUOTE_OFF),
+        b"figcaption" => Some(FIGCAPTION_OFF),
         _ => None,
     }
 }
