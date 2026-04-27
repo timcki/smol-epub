@@ -21,9 +21,12 @@ pub const BOLD_OFF: u8 = b'b';
 pub const ITALIC_ON: u8 = b'I';
 /// Style tag: italic **off** (`[MARKER, ITALIC_OFF]`).
 pub const ITALIC_OFF: u8 = b'i';
-/// Style tag: heading **on** (`[MARKER, HEADING_ON]`).
+/// Style tag: heading **on** (legacy, level-agnostic; aliased to [`H2_ON`]).
+///
+/// Emitted only by [`strip_html_inplace`] which doesn't track heading levels.
+/// New code should prefer the per-level [`H1_ON`]..[`H6_ON`].
 pub const HEADING_ON: u8 = b'H';
-/// Style tag: heading **off** (`[MARKER, HEADING_OFF]`).
+/// Style tag: heading **off** (legacy, aliased to [`H2_OFF`]).
 pub const HEADING_OFF: u8 = b'h';
 /// Style tag: block-quote **on** (`[MARKER, QUOTE_ON]`).
 pub const QUOTE_ON: u8 = b'Q';
@@ -34,6 +37,42 @@ pub const QUOTE_OFF: u8 = b'q';
 pub const BREAK: u8 = b'S';
 /// Style tag: inline image reference (`[MARKER, IMG_REF, len, path…]`).
 pub const IMG_REF: u8 = b'P';
+
+// per-level heading markers; the consumer translates these into a heading
+// tier so h1..h6 can render distinctly without further bytes per line.
+/// Style tag: `<h1>` open.
+pub const H1_ON: u8 = b'1';
+/// Style tag: `<h1>` close.
+pub const H1_OFF: u8 = b'!';
+/// Style tag: `<h2>` open.
+pub const H2_ON: u8 = b'2';
+/// Style tag: `<h2>` close.
+pub const H2_OFF: u8 = b'@';
+/// Style tag: `<h3>` open.
+pub const H3_ON: u8 = b'3';
+/// Style tag: `<h3>` close.
+pub const H3_OFF: u8 = b'#';
+/// Style tag: `<h4>` open.
+pub const H4_ON: u8 = b'4';
+/// Style tag: `<h4>` close.
+pub const H4_OFF: u8 = b'$';
+/// Style tag: `<h5>` open.
+pub const H5_ON: u8 = b'5';
+/// Style tag: `<h5>` close.
+pub const H5_OFF: u8 = b'%';
+/// Style tag: `<h6>` open.
+pub const H6_ON: u8 = b'6';
+/// Style tag: `<h6>` close.
+pub const H6_OFF: u8 = b'^';
+
+/// Style tag: underline **on** (`<u>`, `<ins>`).
+pub const UNDERLINE_ON: u8 = b'U';
+/// Style tag: underline **off**.
+pub const UNDERLINE_OFF: u8 = b'u';
+/// Style tag: strike-through **on** (`<s>`, `<strike>`, `<del>`).
+pub const STRIKE_ON: u8 = b'K';
+/// Style tag: strike-through **off**.
+pub const STRIKE_OFF: u8 = b'k';
 
 /// Returns `true` if `b` is the [`MARKER`] escape byte.
 #[inline]
@@ -1025,7 +1064,14 @@ fn open_style_tag(tag: &[u8]) -> Option<u8> {
     match tag {
         b"b" | b"strong" => Some(BOLD_ON),
         b"i" | b"em" | b"cite" => Some(ITALIC_ON),
-        b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6" => Some(HEADING_ON),
+        b"u" | b"ins" => Some(UNDERLINE_ON),
+        b"s" | b"strike" | b"del" => Some(STRIKE_ON),
+        b"h1" => Some(H1_ON),
+        b"h2" => Some(H2_ON),
+        b"h3" => Some(H3_ON),
+        b"h4" => Some(H4_ON),
+        b"h5" => Some(H5_ON),
+        b"h6" => Some(H6_ON),
         b"blockquote" => Some(QUOTE_ON),
         _ => None,
     }
@@ -1035,7 +1081,14 @@ fn close_style_tag(tag: &[u8]) -> Option<u8> {
     match tag {
         b"b" | b"strong" => Some(BOLD_OFF),
         b"i" | b"em" | b"cite" => Some(ITALIC_OFF),
-        b"h1" | b"h2" | b"h3" | b"h4" | b"h5" | b"h6" => Some(HEADING_OFF),
+        b"u" | b"ins" => Some(UNDERLINE_OFF),
+        b"s" | b"strike" | b"del" => Some(STRIKE_OFF),
+        b"h1" => Some(H1_OFF),
+        b"h2" => Some(H2_OFF),
+        b"h3" => Some(H3_OFF),
+        b"h4" => Some(H4_OFF),
+        b"h5" => Some(H5_OFF),
+        b"h6" => Some(H6_OFF),
         b"blockquote" => Some(QUOTE_OFF),
         _ => None,
     }
