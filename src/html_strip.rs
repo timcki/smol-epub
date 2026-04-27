@@ -170,6 +170,51 @@ enum Phase {
     ImgValStart,
     ImgSrcVal,
     ImgSkipVal,
+    // attribute scan for style-aware block tags (p, div, h1-h6, blockquote,
+    // figure). same shape as the Img* states but only the `style` attribute
+    // is captured; other attributes are skipped.
+    StyleAttrLook,
+    StyleAttrName,
+    StyleAttrGap,
+    StyleValStart,
+    StyleValBody,
+    StyleValSkip,
+}
+
+// per-tag identifier for the alignment-restore stack. only style-aware tags
+// are tracked, so e.g. an inner <span> doesn't pop a parent's alignment.
+const STYLE_TAG_NONE: u8 = 0;
+const STYLE_TAG_P: u8 = 1;
+const STYLE_TAG_DIV: u8 = 2;
+const STYLE_TAG_H1: u8 = 3;
+const STYLE_TAG_H2: u8 = 4;
+const STYLE_TAG_H3: u8 = 5;
+const STYLE_TAG_H4: u8 = 6;
+const STYLE_TAG_H5: u8 = 7;
+const STYLE_TAG_H6: u8 = 8;
+const STYLE_TAG_BLOCKQUOTE: u8 = 9;
+const STYLE_TAG_FIGURE: u8 = 10;
+
+const STYLE_VAL_CAP: usize = 96;
+const ALIGN_STACK_CAP: usize = 8;
+
+// classify a tag name as one of the style-aware kinds, or STYLE_TAG_NONE.
+// the alignment stack only pushes/pops for matching kinds, so non-aware
+// tags like <span> don't perturb the depth.
+fn style_aware_kind(tag: &[u8]) -> u8 {
+    match tag {
+        b"p" => STYLE_TAG_P,
+        b"div" => STYLE_TAG_DIV,
+        b"h1" => STYLE_TAG_H1,
+        b"h2" => STYLE_TAG_H2,
+        b"h3" => STYLE_TAG_H3,
+        b"h4" => STYLE_TAG_H4,
+        b"h5" => STYLE_TAG_H5,
+        b"h6" => STYLE_TAG_H6,
+        b"blockquote" => STYLE_TAG_BLOCKQUOTE,
+        b"figure" => STYLE_TAG_FIGURE,
+        _ => STYLE_TAG_NONE,
+    }
 }
 
 impl Default for HtmlStripStream {
@@ -237,6 +282,23 @@ pub struct HtmlStripStream {
     capture_img: bool,   // true while inside <img> tag body
     img_quote: u8,       // active quote char in attribute value
     in_figure: bool,     // currently between <figure> and </figure>
+
+    // inline style="..." capture for style-aware block tags. mutually
+    // exclusive with capture_img (a <img> tag isn't a style-aware kind).
+    capture_style: bool,
+    style_val_buf: [u8; STYLE_VAL_CAP],
+    style_val_w: u8,
+    style_attr_match: bool, // current attribute name == "style"
+    style_quote: u8,
+
+    // alignment override stack: each entry stores {tag_kind, saved_align}
+    // packed as `(kind << 8) | saved_align_byte`. push when an open emits
+    // ALIGN_*; pop on the matching close emits the saved alignment.
+    align_stack: [u16; ALIGN_STACK_CAP],
+    align_stack_depth: u8,
+    // last alignment marker byte we asked the consumer to apply. starts at
+    // ALIGN_RESET so a top-level pop restores the reader's default.
+    current_inline_align: u8,
 }
 
 impl HtmlStripStream {
@@ -275,6 +337,14 @@ impl HtmlStripStream {
             capture_img: false,
             img_quote: 0,
             in_figure: false,
+            capture_style: false,
+            style_val_buf: [0u8; STYLE_VAL_CAP],
+            style_val_w: 0,
+            style_attr_match: false,
+            style_quote: 0,
+            align_stack: [0u16; ALIGN_STACK_CAP],
+            align_stack_depth: 0,
+            current_inline_align: ALIGN_RESET,
         }
     }
 
@@ -381,11 +451,15 @@ impl HtmlStripStream {
                         if b == b'>' {
                             if self.capture_img {
                                 self.finish_img_tag();
+                            } else if self.capture_style {
+                                self.finish_style_tag();
                             } else {
                                 self.finish_tag();
                             }
                         } else if self.capture_img {
                             self.phase = Phase::ImgBody;
+                        } else if self.capture_style {
+                            self.phase = Phase::StyleAttrLook;
                         } else {
                             self.phase = Phase::TagBody;
                         }
@@ -488,6 +562,113 @@ impl HtmlStripStream {
                         self.phase = Phase::ImgBody;
                         if self.img_quote == 0 && b == b'>' {
                             self.finish_img_tag();
+                        }
+                    }
+                }
+
+                // attribute scan for style-aware tags. mirrors the Img*
+                // pipeline: name accumulator -> '=' -> value capture or
+                // skip. only the `style` attribute is captured; everything
+                // else funnels through StyleValSkip.
+                Phase::StyleAttrLook => {
+                    if b == b'>' {
+                        self.finish_style_tag();
+                    } else if b.is_ascii_alphabetic() || b == b'_' {
+                        self.tag_len = 0;
+                        self.tag_buf[0] = b.to_ascii_lowercase();
+                        self.tag_len = 1;
+                        self.phase = Phase::StyleAttrName;
+                    }
+                    // whitespace, '/', etc: stay
+                }
+
+                Phase::StyleAttrName => {
+                    if b == b'=' {
+                        let name = &self.tag_buf[..self.tag_len as usize];
+                        self.style_attr_match = name == b"style";
+                        self.phase = Phase::StyleValStart;
+                    } else if b == b'>' {
+                        self.finish_style_tag();
+                    } else if is_html_ws(b) || b == b'/' {
+                        self.phase = Phase::StyleAttrGap;
+                    } else if (self.tag_len as usize) < TAG_BUF_CAP {
+                        self.tag_buf[self.tag_len as usize] = b.to_ascii_lowercase();
+                        self.tag_len += 1;
+                    }
+                }
+
+                Phase::StyleAttrGap => {
+                    if b == b'=' {
+                        let name = &self.tag_buf[..self.tag_len as usize];
+                        self.style_attr_match = name == b"style";
+                        self.phase = Phase::StyleValStart;
+                    } else if b == b'>' {
+                        self.finish_style_tag();
+                    } else if b.is_ascii_alphabetic() || b == b'_' {
+                        self.tag_len = 0;
+                        self.tag_buf[0] = b.to_ascii_lowercase();
+                        self.tag_len = 1;
+                        self.phase = Phase::StyleAttrName;
+                    }
+                    // whitespace, '/': stay
+                }
+
+                Phase::StyleValStart => {
+                    if b == b'"' || b == b'\'' {
+                        self.style_quote = b;
+                        self.phase = if self.style_attr_match {
+                            Phase::StyleValBody
+                        } else {
+                            Phase::StyleValSkip
+                        };
+                    } else if b == b'>' {
+                        self.finish_style_tag();
+                    } else if !is_html_ws(b) {
+                        self.style_quote = 0;
+                        if self.style_attr_match {
+                            let pos = self.style_val_w as usize;
+                            if pos < STYLE_VAL_CAP {
+                                self.style_val_buf[pos] = b;
+                                self.style_val_w += 1;
+                            }
+                            self.phase = Phase::StyleValBody;
+                        } else {
+                            self.phase = Phase::StyleValSkip;
+                        }
+                    }
+                }
+
+                Phase::StyleValBody => {
+                    let done = if self.style_quote != 0 {
+                        b == self.style_quote
+                    } else {
+                        is_html_ws(b) || b == b'>' || b == b'/'
+                    };
+                    if done {
+                        self.style_attr_match = false;
+                        self.phase = Phase::StyleAttrLook;
+                        if self.style_quote == 0 && b == b'>' {
+                            self.finish_style_tag();
+                        }
+                    } else {
+                        let pos = self.style_val_w as usize;
+                        if pos < STYLE_VAL_CAP {
+                            self.style_val_buf[pos] = b;
+                            self.style_val_w += 1;
+                        }
+                    }
+                }
+
+                Phase::StyleValSkip => {
+                    let done = if self.style_quote != 0 {
+                        b == self.style_quote
+                    } else {
+                        is_html_ws(b) || b == b'>' || b == b'/'
+                    };
+                    if done {
+                        self.phase = Phase::StyleAttrLook;
+                        if self.style_quote == 0 && b == b'>' {
+                            self.finish_style_tag();
                         }
                     }
                 }
@@ -876,6 +1057,45 @@ impl HtmlStripStream {
             self.img_attr_kind = IMG_ATTR_NONE;
             self.img_flags = if self.in_figure { IMG_FLAG_FIGURE } else { 0 };
         }
+
+        // style-aware open: enter attribute scan to look for style="..." and
+        // push a placeholder onto align_stack. finish_style_tag will set the
+        // saved-align byte if an inline override was found; otherwise it
+        // stays 0, which means "no emit on pop".
+        if !is_close {
+            let kind = style_aware_kind(name);
+            if kind != STYLE_TAG_NONE {
+                self.capture_style = true;
+                self.style_val_w = 0;
+                self.style_attr_match = false;
+                if (self.align_stack_depth as usize) < ALIGN_STACK_CAP {
+                    let entry: u16 = (kind as u16) << 8; // saved_align = 0
+                    self.align_stack[self.align_stack_depth as usize] = entry;
+                    self.align_stack_depth += 1;
+                }
+            }
+        }
+
+        // style-aware close: pop the matching entry. saved_align == 0 means
+        // the open didn't override alignment and we emit nothing. otherwise
+        // emit the saved align marker and update current_inline_align so
+        // future overrides nest correctly.
+        if is_close {
+            let kind = style_aware_kind(name);
+            if kind != STYLE_TAG_NONE && self.align_stack_depth > 0 {
+                let top = self.align_stack[self.align_stack_depth as usize - 1];
+                let top_kind = (top >> 8) as u8;
+                let saved_align = (top & 0xff) as u8;
+                if top_kind == kind {
+                    self.align_stack_depth -= 1;
+                    if saved_align != 0 {
+                        self.current_inline_align = saved_align;
+                        self.push_pending(MARKER);
+                        self.push_pending(saved_align);
+                    }
+                }
+            }
+        }
     }
 
     // transition out of TagName/TagBody on '>'
@@ -886,6 +1106,33 @@ impl HtmlStripStream {
         } else {
             self.phase = Phase::Text;
         }
+    }
+
+    // finish a style-aware open tag. parses the captured `style="..."` value
+    // for text-align and, if present, emits the corresponding ALIGN_* marker
+    // and stamps the saved alignment onto the top of `align_stack` so the
+    // matching close pops it back out. classify_tag already pushed the
+    // placeholder entry for this open.
+    fn finish_style_tag(&mut self) {
+        self.capture_style = false;
+
+        let val = &self.style_val_buf[..self.style_val_w as usize];
+        if let Some(align_byte) = parse_text_align(val) {
+            // record the align we'll restore on close, packed into the top
+            // align_stack entry. depth must be > 0 since classify_tag pushed.
+            if self.align_stack_depth > 0 {
+                let depth = self.align_stack_depth as usize - 1;
+                let kind = (self.align_stack[depth] >> 8) as u8;
+                let entry = ((kind as u16) << 8) | self.current_inline_align as u16;
+                self.align_stack[depth] = entry;
+            }
+            self.push_deferred_marker(align_byte);
+            self.current_inline_align = align_byte;
+        }
+
+        self.style_val_w = 0;
+        self.style_attr_match = false;
+        self.phase = Phase::Text;
     }
 
     // identify the captured attribute name (in tag_buf) and update img_attr_kind.
@@ -1062,6 +1309,78 @@ fn next_img_val_phase(kind: u8) -> Phase {
         IMG_ATTR_NONE => Phase::ImgSkipVal,
         _ => Phase::ImgSrcVal,
     }
+}
+
+// case-insensitive prefix match: returns Some(end_index) into haystack at
+// the position past the prefix if matched, None otherwise.
+fn ascii_match_lower(haystack: &[u8], from: usize, prefix: &[u8]) -> Option<usize> {
+    if from + prefix.len() > haystack.len() {
+        return None;
+    }
+    for i in 0..prefix.len() {
+        if haystack[from + i].to_ascii_lowercase() != prefix[i] {
+            return None;
+        }
+    }
+    Some(from + prefix.len())
+}
+
+// scan a CSS-style attribute value for `text-align: <kw>` and return the
+// matching ALIGN_* marker byte. only the four keywords we know about are
+// recognised (left, center, right, justify); anything else returns None.
+// supports multiple `;`-separated declarations and is case-insensitive.
+fn parse_text_align(value: &[u8]) -> Option<u8> {
+    let n = value.len();
+    let mut i = 0usize;
+    while i < n {
+        // skip leading ws and stray semicolons between declarations
+        while i < n && (is_html_ws(value[i]) || value[i] == b';') {
+            i += 1;
+        }
+        if i >= n {
+            return None;
+        }
+        // try to match "text-align"
+        let after_name = if let Some(j) = ascii_match_lower(value, i, b"text-align") {
+            j
+        } else {
+            // skip to the next ';' to step past this declaration
+            while i < n && value[i] != b';' {
+                i += 1;
+            }
+            continue;
+        };
+        // consume optional ws, expect ':'
+        let mut j = after_name;
+        while j < n && is_html_ws(value[j]) {
+            j += 1;
+        }
+        if j >= n || value[j] != b':' {
+            // declaration like "text-align-foo:..."; not what we want
+            i = j;
+            while i < n && value[i] != b';' {
+                i += 1;
+            }
+            continue;
+        }
+        j += 1;
+        while j < n && is_html_ws(value[j]) {
+            j += 1;
+        }
+        // match value keyword
+        return if ascii_match_lower(value, j, b"center").is_some() {
+            Some(ALIGN_CENTER)
+        } else if ascii_match_lower(value, j, b"right").is_some() {
+            Some(ALIGN_RIGHT)
+        } else if ascii_match_lower(value, j, b"left").is_some() {
+            Some(ALIGN_LEFT)
+        } else if ascii_match_lower(value, j, b"justify").is_some() {
+            Some(ALIGN_JUSTIFY)
+        } else {
+            None
+        };
+    }
+    None
 }
 
 /// Strip HTML tags from a complete buffer **in place**, producing plain text
