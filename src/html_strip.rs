@@ -942,12 +942,11 @@ impl HtmlStripStream {
                     self.img_alt_w += 1;
                 }
             }
-            IMG_ATTR_WIDTH | IMG_ATTR_HEIGHT => {
-                if b.is_ascii_digit() {
-                    let n = self.img_num.saturating_mul(10);
-                    self.img_num = n.saturating_add((b - b'0') as u16);
-                }
-                // non-digit bytes (units, separators) are ignored
+            // ascii digits accumulate into img_num; non-digit bytes (units,
+            // separators) are silently dropped so `width="80px"` parses as 80.
+            IMG_ATTR_WIDTH | IMG_ATTR_HEIGHT if b.is_ascii_digit() => {
+                let n = self.img_num.saturating_mul(10);
+                self.img_num = n.saturating_add((b - b'0') as u16);
             }
             _ => {}
         }
