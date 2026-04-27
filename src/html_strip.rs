@@ -74,6 +74,31 @@ pub const STRIKE_ON: u8 = b'K';
 /// Style tag: strike-through **off**.
 pub const STRIKE_OFF: u8 = b'k';
 
+// alignment markers; emitted by tag-keyed defaults (h1/h2/figcaption)
+// and by inline `style="text-align:..."`. ALIGN_RESET restores the
+// reader's default (typically justify) when a block closes.
+/// Style tag: align left.
+pub const ALIGN_LEFT: u8 = b'L';
+/// Style tag: align center.
+pub const ALIGN_CENTER: u8 = b'C';
+/// Style tag: align right.
+pub const ALIGN_RIGHT: u8 = b'R';
+/// Style tag: justify (full).
+pub const ALIGN_JUSTIFY: u8 = b'J';
+/// Style tag: reset alignment to the reader's default.
+pub const ALIGN_RESET: u8 = b'X';
+
+/// Style tag: end the current page; resume on a fresh page.
+///
+/// Emitted before `<h1>` (chapter break) and for blocks carrying
+/// `page-break-before: always`.
+pub const PAGE_BREAK: u8 = b'F';
+
+/// Style tag: figure caption open.
+pub const FIGCAPTION_ON: u8 = b'G';
+/// Style tag: figure caption close.
+pub const FIGCAPTION_OFF: u8 = b'g';
+
 /// Returns `true` if `b` is the [`MARKER`] escape byte.
 #[inline]
 pub const fn is_marker(b: u8) -> bool {
@@ -83,8 +108,12 @@ pub const fn is_marker(b: u8) -> bool {
 const TAG_BUF_CAP: usize = 16;
 const ENTITY_BUF_CAP: usize = 12;
 const BANG_BUF_CAP: usize = 8;
-const PENDING_CAP: usize = 24;
-const DEFERRED_CAP: usize = 8;
+const PENDING_CAP: usize = 32;
+// holds queued deferred bytes flushed before the next text byte. tag-keyed
+// defaults can stack several open markers (e.g. <h1> emits PAGE_BREAK +
+// ALIGN_CENTER + H1_ON = 6 bytes; nested <li> bullet adds 4 UTF-8 bytes;
+// inline <b><i> add 4 more) so 32 is sized for the worst realistic stack.
+const DEFERRED_CAP: usize = 32;
 const IMG_SRC_CAP: usize = 128; // 3-byte marker header + up to 125 path bytes
 
 // state machine phases
@@ -671,6 +700,16 @@ impl HtmlStripStream {
         }
     }
 
+    // append raw UTF-8 bytes to the deferred queue (no MARKER prefix). used
+    // for tag-keyed text injection like the U+2022 bullet on `<li>`.
+    fn push_deferred_bytes(&mut self, bytes: &[u8]) {
+        let n = self.deferred_len as usize;
+        if n + bytes.len() <= DEFERRED_CAP {
+            self.deferred[n..n + bytes.len()].copy_from_slice(bytes);
+            self.deferred_len += bytes.len() as u8;
+        }
+    }
+
     // queue visible text byte; flush deferred newlines and style markers first
     fn queue_text(&mut self, b: u8) {
         // deferred newlines
@@ -755,10 +794,26 @@ impl HtmlStripStream {
             self.push_pending(m);
         }
 
+        // tag-keyed close defaults; emit alignment reset / supporting style
+        // off for tags that introduced an override on open. order: after the
+        // primary close marker so heading-off precedes alignment-reset.
+        if is_close {
+            for &b in tag_default_close(name) {
+                self.push_pending(b);
+            }
+        }
+
         // block elements set deferred paragraph breaks
         if is_block_element(name) {
             self.trailing_nl = self.trailing_nl.max(2);
             self.last_was_space = true;
+        }
+
+        // tag-keyed open defaults: PAGE_BREAK / ALIGN_* / bullet, queued
+        // before the natural style marker so e.g. PAGE_BREAK -> ALIGN_CENTER
+        // -> H1_ON -> text matches the visual order required by the wrapper.
+        if !is_close {
+            self.push_deferred_bytes(tag_default_open(name));
         }
 
         // open-tag markers are deferred (after newlines, before text);
@@ -1057,6 +1112,33 @@ fn is_block_element(name: &[u8]) -> bool {
             | b"hr"
             | b"table"
     )
+}
+
+// raw bytes injected before a tag's content for tag-keyed defaults. content
+// is bytes (markers and/or UTF-8 text) drained from the deferred queue once
+// the tag's first text byte arrives, so paragraph breaks emit first.
+//   h1 -> PAGE_BREAK + ALIGN_CENTER (heading marker comes from open_style_tag)
+//   h2 -> ALIGN_CENTER
+//   figcaption -> ITALIC_ON + ALIGN_CENTER (italic+centered caption)
+//   li -> U+2022 + ' ' (visible bullet glyph)
+fn tag_default_open(tag: &[u8]) -> &'static [u8] {
+    match tag {
+        b"h1" => &[MARKER, PAGE_BREAK, MARKER, ALIGN_CENTER],
+        b"h2" => &[MARKER, ALIGN_CENTER],
+        b"figcaption" => &[MARKER, ITALIC_ON, MARKER, ALIGN_CENTER],
+        b"li" => b"\xE2\x80\xA2 ",
+        _ => &[],
+    }
+}
+
+// raw bytes appended to pending after a tag's natural close marker. used to
+// undo any alignment / inline-style override emitted by `tag_default_open`.
+fn tag_default_close(tag: &[u8]) -> &'static [u8] {
+    match tag {
+        b"h1" | b"h2" => &[MARKER, ALIGN_RESET],
+        b"figcaption" => &[MARKER, ITALIC_OFF, MARKER, ALIGN_RESET],
+        _ => &[],
+    }
 }
 
 // marker byte for formatting tags; used by classify_tag
