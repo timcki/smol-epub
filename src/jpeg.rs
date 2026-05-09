@@ -110,11 +110,14 @@ struct JpegState {
     scan_num_comp: u8,
     scan_order: [u8; MAX_COMP],
     progressive: bool,
-    // first-scan spectral selection start (0 = DC)
+    // current-scan spectral selection start (0 = DC)
     scan_ss: u8,
-    // first-scan spectral selection end (0 = DC only, 63 = all AC)
+    // current-scan spectral selection end (0 = DC only, 63 = all AC)
     scan_se: u8,
-    // first-scan successive approximation low bit (point transform)
+    // current-scan successive approximation high bit (0 = first scan,
+    // !=0 = refinement of an earlier scan)
+    scan_ah: u8,
+    // current-scan successive approximation low bit (point transform)
     scan_al: u8,
     // logical position of the byte after the first SOS marker (FF DA);
     // used by the progressive band loop to seek back to entropy start.
@@ -161,6 +164,28 @@ pub trait JpegRead {
     /// reverse seeks (e.g. DEFLATE) this is supported but slow.
     /// Returns `Err` if `pos` is past the end of the stream.
     fn seek(&mut self, pos: u32) -> Result<(), &'static str>;
+}
+
+// allow &mut R to satisfy JpegRead so the progressive band loop can
+// re-borrow the reader between scans (parse_sos + entropy decode +
+// parse_sos + ...) without consuming it.
+impl<R: JpegRead + ?Sized> JpegRead for &mut R {
+    #[inline]
+    fn read_byte(&mut self) -> Result<u8, &'static str> {
+        (**self).read_byte()
+    }
+    #[inline]
+    fn is_eof(&self) -> bool {
+        (**self).is_eof()
+    }
+    #[inline]
+    fn position(&self) -> u32 {
+        (**self).position()
+    }
+    #[inline]
+    fn seek(&mut self, pos: u32) -> Result<(), &'static str> {
+        (**self).seek(pos)
+    }
 }
 
 /// [`JpegRead`] backed by an in-memory slice.
@@ -606,10 +631,14 @@ impl<R: JpegRead> BitReader<R> {
 /// Decode a JPEG to a 1-bit dithered bitmap from any [`JpegRead`].
 ///
 /// The image is integer-downscaled so the result fits within
-/// `max_w` × `max_h` pixels. Progressive JPEGs (SOF2) are rejected.
+/// `max_w` × `max_h` pixels. Both baseline (SOF0) and progressive
+/// (SOF2) JPEGs are supported. The reader is consumed; on success,
+/// all bytes up to (but not necessarily including) the EOI have
+/// been read from the source.
 ///
-/// The reader is consumed; on success, all bytes up to (but not
-/// necessarily including) the EOI have been read from the source.
+/// Progressive decode buffers a band of MCU rows at a time and
+/// re-reads the bitstream once per band; peak RAM stays bounded
+/// at the cost of slower decode for large images.
 pub fn decode_jpeg<R: JpegRead>(
     mut reader: R,
     max_w: u16,
@@ -617,7 +646,11 @@ pub fn decode_jpeg<R: JpegRead>(
 ) -> Result<DecodedImage, &'static str> {
     let st = parse_markers(&mut reader)?;
     validate_tables(&st)?;
-    decode_baseline(&st, BitReader::new(reader), max_w, max_h)
+    if st.progressive {
+        decode_progressive(st, reader, max_w, max_h)
+    } else {
+        decode_baseline(&st, BitReader::new(reader), max_w, max_h)
+    }
 }
 
 /// Read the dimensions of a JPEG without performing a full decode.
@@ -655,14 +688,6 @@ fn decode_baseline<R: JpegRead>(
     max_w: u16,
     max_h: u16,
 ) -> Result<DecodedImage, &'static str> {
-    if st.progressive {
-        // multi-scan progressive entropy streams (typical: DC-only first
-        // scan, then several AC partial scans, then refinement scans)
-        // cannot be reconstructed correctly from a single first-scan pass.
-        // bail cleanly so callers fall back to alt text instead of caching
-        // a corrupted preview.
-        return Err("jpeg: progressive JPEG not supported");
-    }
     let w = st.width as usize;
     let h = st.height as usize;
     if w == 0 || h == 0 {
@@ -803,6 +828,712 @@ fn decode_baseline<R: JpegRead>(
             out_y += 1;
             core::mem::swap(&mut err_cur, &mut err_nxt);
             err_nxt.fill(0);
+        }
+    }
+
+    Ok(DecodedImage {
+        width: out_w as u16,
+        height: out_y as u16,
+        data: output,
+        stride: out_stride,
+    })
+}
+
+// ── progressive decode (multi-scan, multi-pass) ────────────────────
+//
+// progressive JPEGs encode each MCU's coefficients across several
+// scans (DC first, then AC band by band, optionally refined by
+// successive approximation). a single forward pass cannot emit
+// pixels because later scans refine earlier coefficients; we must
+// hold quantized coefficients resident until the last refinement
+// for each MCU.
+//
+// to stay inside the e-reader's heap budget we band the image
+// vertically: K MCU rows of Y coefficients are buffered at a time,
+// and the bitstream is re-read from `first_sos_offset` once per
+// band. for each pass, only Y blocks whose MCU row falls inside
+// the current band are stored; out-of-band Y blocks and chroma
+// blocks are entropy-decoded into a scratch slot and discarded.
+//
+// when the band's scans are exhausted, coefficients are
+// dequantized and IDCT'd into Y pixels, then the band's rows
+// are streamed through the same Floyd-Steinberg pipeline as
+// baseline.
+
+// budget for the band coefficient buffer (i16, raw quantized).
+// 96 KB leaves ~50 KB heap headroom over the existing ~30 KB
+// baseline decode peak. note actual peak adds ~4 KB strip + dither
+// state and ~5 KB y_row, which the configured budget tolerates.
+const MAX_BAND_BYTES: usize = 96 * 1024;
+
+#[inline]
+fn band_block_offset(
+    my: usize,
+    mx: usize,
+    bidx: usize,
+    mcus_x: usize,
+    y_blocks_per_mcu: usize,
+) -> usize {
+    (((my * mcus_x) + mx) * y_blocks_per_mcu + bidx) * 64
+}
+
+// DC first scan: read DC differential, scale by Al, store at coeff 0
+fn pdc_first<R: JpegRead>(
+    r: &mut BitReader<R>,
+    dc_ht: &HuffTable,
+    dc_pred: &mut i32,
+    al: u8,
+    blk: &mut [i16],
+) -> Result<(), &'static str> {
+    let dc_size = huff_decode(r, dc_ht)?;
+    if dc_size > 0 {
+        if dc_size > 11 {
+            return Err("jpeg: DC size > 11");
+        }
+        let bits = r.read_bits(dc_size)?;
+        *dc_pred += extend(bits, dc_size);
+    }
+    blk[0] = ((*dc_pred) << al) as i16;
+    Ok(())
+}
+
+// DC refinement: 1 bit, OR'd into existing DC at bit Al
+fn pdc_refine<R: JpegRead>(
+    r: &mut BitReader<R>,
+    al: u8,
+    blk: &mut [i16],
+) -> Result<(), &'static str> {
+    let bit = r.read_bits(1)?;
+    if bit != 0 {
+        blk[0] |= 1i16 << al;
+    }
+    Ok(())
+}
+
+// AC first scan: RLE+Huffman over coefficients [ss..=se], scaled by Al,
+// with EOBRUN handling for runs of all-zero blocks.
+fn pac_first<R: JpegRead>(
+    r: &mut BitReader<R>,
+    ac_ht: &HuffTable,
+    ss: usize,
+    se: usize,
+    al: u8,
+    eobrun: &mut u16,
+    blk: &mut [i16],
+) -> Result<(), &'static str> {
+    if *eobrun > 0 {
+        *eobrun -= 1;
+        return Ok(());
+    }
+    let mut k = ss;
+    while k <= se {
+        let sym = huff_decode(r, ac_ht)?;
+        let run = (sym >> 4) as usize;
+        let size = sym & 0x0F;
+        if size == 0 {
+            if run == 15 {
+                k += 16;
+            } else {
+                // EOBn: 1<<run + read run bits
+                let bits = if run > 0 { r.read_bits(run as u8)? } else { 0 };
+                let count = (1u32 << run) + bits;
+                *eobrun = (count - 1) as u16;
+                break;
+            }
+        } else {
+            k += run;
+            if k > se {
+                return Err("jpeg: AC index overflow (first)");
+            }
+            let bits = r.read_bits(size)?;
+            let val = extend(bits, size) as i16;
+            blk[ZZ[k]] = val << al;
+            k += 1;
+        }
+    }
+    Ok(())
+}
+
+// AC refinement scan: refines existing nonzero coefficients in
+// [ss..=se] by setting bit Al; new nonzero coefficients are
+// introduced as ±(1<<Al) at positions where the run skipped past
+// zeros. EOBRUN handling: when an EOBn symbol is read, this block's
+// remaining nonzeros still get refinement bits, then `eobrun` is
+// armed with N-1 (so the next N-1 blocks are walked in the
+// "during EOBRUN" branch).
+fn pac_refine<R: JpegRead>(
+    r: &mut BitReader<R>,
+    ac_ht: &HuffTable,
+    ss: usize,
+    se: usize,
+    al: u8,
+    eobrun: &mut u16,
+    blk: &mut [i16],
+) -> Result<(), &'static str> {
+    let p1: i16 = 1i16 << al;
+    let m1: i16 = (-1i16) << al;
+
+    // helper: refine the existing nonzero at zigzag index k by
+    // reading one refinement bit. returns Ok regardless of value;
+    // the caller advances k.
+    fn refine_existing<R: JpegRead>(
+        r: &mut BitReader<R>,
+        blk: &mut [i16],
+        pos: usize,
+        p1: i16,
+        m1: i16,
+    ) -> Result<(), &'static str> {
+        if r.read_bits(1)? != 0 {
+            if (blk[pos] & p1) == 0 {
+                if blk[pos] >= 0 {
+                    blk[pos] += p1;
+                } else {
+                    blk[pos] += m1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    if *eobrun > 0 {
+        // not the EOB block; walk the band refining existing nonzeros
+        // and decrement the EOBRUN counter.
+        let mut k = ss;
+        while k <= se {
+            let pos = ZZ[k];
+            if blk[pos] != 0 {
+                refine_existing(r, blk, pos, p1, m1)?;
+            }
+            k += 1;
+        }
+        *eobrun -= 1;
+        return Ok(());
+    }
+
+    let mut k = ss;
+    while k <= se {
+        let sym = huff_decode(r, ac_ht)?;
+        let run = (sym >> 4) as usize;
+        let size = sym & 0x0F;
+
+        let new_val: i16;
+        if size == 0 {
+            if run != 15 {
+                // EOBn: refine this block's remaining nonzeros, then
+                // arm EOBRUN with the count - 1 (this block consumes
+                // one of the N).
+                let bits = if run > 0 { r.read_bits(run as u8)? } else { 0 };
+                let count = (1u32 << run) + bits;
+                while k <= se {
+                    let pos = ZZ[k];
+                    if blk[pos] != 0 {
+                        refine_existing(r, blk, pos, p1, m1)?;
+                    }
+                    k += 1;
+                }
+                *eobrun = (count - 1) as u16;
+                return Ok(());
+            }
+            // ZRL: 16 zero coefficients to skip; no new value placed.
+            new_val = 0;
+        } else {
+            if size != 1 {
+                return Err("jpeg: bad refinement size");
+            }
+            new_val = if r.read_bits(1)? == 0 { m1 } else { p1 };
+        }
+
+        // walk forward, refining each existing nonzero and counting
+        // down `run` zero coefficients. when run reaches 0, the next
+        // zero is where new_val (if non-zero) belongs.
+        let mut zerorun = run as i32;
+        loop {
+            if k > se {
+                if new_val == 0 {
+                    // ZRL ran past end with no remaining nonzeros to
+                    // place — accept.
+                    return Ok(());
+                }
+                log::warn!(
+                    "jpeg: AC refine overflow ss={} se={} k={} run={} size={} sym={:#x}",
+                    ss,
+                    se,
+                    k,
+                    run,
+                    size,
+                    sym,
+                );
+                // TODO(progressive): some real-world progressive JPEGs
+                // hit this path during the high-bit AC refinement scan
+                // (Ah > 0). the failure pattern is a "place new ±1"
+                // symbol arriving when no zero remains in [k..=Se],
+                // suggesting a state mismatch with prior scans. for
+                // now we error so callers fall back to alt text rather
+                // than caching a corrupted preview.
+                return Err("jpeg: AC refinement overflow");
+            }
+            let pos = ZZ[k];
+            if blk[pos] != 0 {
+                refine_existing(r, blk, pos, p1, m1)?;
+                k += 1;
+            } else {
+                if zerorun == 0 {
+                    if new_val != 0 {
+                        blk[pos] = new_val;
+                    }
+                    k += 1;
+                    break;
+                }
+                zerorun -= 1;
+                k += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_progressive_block<R: JpegRead>(
+    r: &mut BitReader<R>,
+    dc_ht: &HuffTable,
+    ac_ht: &HuffTable,
+    dc_pred: &mut i32,
+    eobrun: &mut u16,
+    ss: usize,
+    se: usize,
+    ah: u8,
+    al: u8,
+    blk: &mut [i16],
+) -> Result<(), &'static str> {
+    if ss == 0 {
+        // DC scan
+        if ah == 0 {
+            pdc_first(r, dc_ht, dc_pred, al, blk)
+        } else {
+            pdc_refine(r, al, blk)
+        }
+    } else {
+        // AC scan
+        if ah == 0 {
+            pac_first(r, ac_ht, ss, se, al, eobrun, blk)
+        } else {
+            pac_refine(r, ac_ht, ss, se, al, eobrun, blk)
+        }
+    }
+}
+
+// walk one progressive scan to its terminating marker. returns the
+// non-RST marker code that ended the scan (M_SOS for next scan,
+// M_EOI for end of file).
+#[allow(clippy::too_many_arguments)]
+fn walk_progressive_scan<R: JpegRead>(
+    bit: &mut BitReader<&mut R>,
+    st: &JpegState,
+    band_y: &mut [i16],
+    band_top: usize,
+    band_bottom: usize,
+    mcus_x: usize,
+    mcus_y: usize,
+    y_blocks_per_mcu: usize,
+) -> Result<u8, &'static str> {
+    let mut dc_pred = [0i32; MAX_COMP];
+    let mut eobrun: u16 = 0;
+    let mut scratch = [0i16; 64];
+
+    let ss = st.scan_ss as usize;
+    let se = st.scan_se as usize;
+    let ah = st.scan_ah;
+    let al = st.scan_al;
+    let restart_interval = st.restart_interval as u32;
+
+    let interleaved = st.scan_num_comp > 1;
+
+    // helper: pull a block target slice for the given MCU/component;
+    // returns a scratch slice if outside the band or non-Y component.
+    if interleaved {
+        let mut mcu_cnt: u32 = 0;
+        let total_mcus = (mcus_x * mcus_y) as u32;
+        for my in 0..mcus_y {
+            let in_band = my >= band_top && my < band_bottom;
+            let band_my = my.wrapping_sub(band_top);
+            for mx in 0..mcus_x {
+                for sci in 0..st.scan_num_comp as usize {
+                    let ci = st.scan_order[sci] as usize;
+                    let c = &st.comp[ci];
+                    let dc_ht = &st.dc_huff[c.dc_tbl as usize];
+                    let ac_ht = &st.ac_huff[c.ac_tbl as usize];
+                    for bv in 0..c.v_samp as usize {
+                        for bh in 0..c.h_samp as usize {
+                            let blk: &mut [i16] = if ci == 0 && in_band {
+                                let bidx = bv * c.h_samp as usize + bh;
+                                let off = band_block_offset(
+                                    band_my,
+                                    mx,
+                                    bidx,
+                                    mcus_x,
+                                    y_blocks_per_mcu,
+                                );
+                                &mut band_y[off..off + 64]
+                            } else {
+                                &mut scratch
+                            };
+                            decode_progressive_block(
+                                bit,
+                                dc_ht,
+                                ac_ht,
+                                &mut dc_pred[ci],
+                                &mut eobrun,
+                                ss,
+                                se,
+                                ah,
+                                al,
+                                blk,
+                            )?;
+                        }
+                    }
+                }
+                mcu_cnt += 1;
+                if restart_interval > 0
+                    && mcu_cnt % restart_interval == 0
+                    && mcu_cnt < total_mcus
+                {
+                    bit.consume_restart()?;
+                    dc_pred.fill(0);
+                    eobrun = 0;
+                }
+            }
+        }
+    } else {
+        // non-interleaved single-component scan: data units are blocks
+        // of the single component, in raster order across the
+        // component's full block grid.
+        let ci = st.scan_order[0] as usize;
+        let c = &st.comp[ci];
+        let dc_ht = &st.dc_huff[c.dc_tbl as usize];
+        let ac_ht = &st.ac_huff[c.ac_tbl as usize];
+        let blocks_x = mcus_x * c.h_samp as usize;
+        let blocks_y = mcus_y * c.v_samp as usize;
+        let total_blocks = (blocks_x * blocks_y) as u32;
+        let mut blk_cnt: u32 = 0;
+        for cy in 0..blocks_y {
+            let my = cy / c.v_samp as usize;
+            let bv = cy % c.v_samp as usize;
+            let in_band = my >= band_top && my < band_bottom;
+            let band_my = my.wrapping_sub(band_top);
+            for cx in 0..blocks_x {
+                let mx = cx / c.h_samp as usize;
+                let bh = cx % c.h_samp as usize;
+                let blk: &mut [i16] = if ci == 0 && in_band {
+                    let bidx = bv * c.h_samp as usize + bh;
+                    let off = band_block_offset(
+                        band_my,
+                        mx,
+                        bidx,
+                        mcus_x,
+                        y_blocks_per_mcu,
+                    );
+                    &mut band_y[off..off + 64]
+                } else {
+                    &mut scratch
+                };
+                decode_progressive_block(
+                    bit,
+                    dc_ht,
+                    ac_ht,
+                    &mut dc_pred[ci],
+                    &mut eobrun,
+                    ss,
+                    se,
+                    ah,
+                    al,
+                    blk,
+                )?;
+                blk_cnt += 1;
+                if restart_interval > 0
+                    && blk_cnt % restart_interval == 0
+                    && blk_cnt < total_blocks
+                {
+                    bit.consume_restart()?;
+                    dc_pred.fill(0);
+                    eobrun = 0;
+                }
+            }
+        }
+    }
+
+    // entropy ended; the terminating marker should be stashed in
+    // bit.marker by the FF-handling path inside next_byte.
+    if bit.marker == 0 {
+        // scan ran off the end without a marker — search forward for
+        // any FF xx (excluding RSTn / 0xFF fill / 0x00 stuffing) so the
+        // caller can decide what to do with it.
+        loop {
+            if bit.source.is_eof() {
+                return Err("jpeg: scan ended without terminating marker");
+            }
+            let b = bit.source.read_byte()?;
+            if b != 0xFF {
+                continue;
+            }
+            loop {
+                if bit.source.is_eof() {
+                    return Err("jpeg: scan ended without terminating marker");
+                }
+                let m = bit.source.read_byte()?;
+                match m {
+                    0xFF => continue,
+                    0x00 => break,
+                    M_RST0..=M_RST7 => break,
+                    _ => {
+                        bit.marker = m;
+                        break;
+                    }
+                }
+            }
+            if bit.marker != 0 {
+                break;
+            }
+        }
+    }
+    let m = bit.marker;
+    bit.marker = 0;
+    Ok(m)
+}
+
+fn decode_progressive<R: JpegRead>(
+    mut st: Box<JpegState>,
+    mut reader: R,
+    max_w: u16,
+    max_h: u16,
+) -> Result<DecodedImage, &'static str> {
+    let w = st.width as usize;
+    let h = st.height as usize;
+    if w == 0 || h == 0 {
+        return Err("jpeg: zero dimensions");
+    }
+    if (w as u32).saturating_mul(h as u32) > MAX_PIXELS {
+        return Err("jpeg: exceeds pixel limit");
+    }
+
+    let scale = {
+        let sw = (w + max_w as usize - 1) / max_w as usize;
+        let sh = (h + max_h as usize - 1) / max_h as usize;
+        sw.max(sh).max(1)
+    };
+    let out_w = (w / scale).max(1);
+    let out_h = (h / scale).max(1);
+    let out_stride = (out_w + 7) / 8;
+
+    let mcu_w = st.max_h as usize * 8;
+    let mcu_h = st.max_v as usize * 8;
+    let mcus_x = (w + mcu_w - 1) / mcu_w;
+    let mcus_y = (h + mcu_h - 1) / mcu_h;
+    let row_w = mcus_x * mcu_w;
+
+    // Y component is comp[0]; blocks-per-MCU for Y equals max_h * max_v
+    // (Y is by convention the highest-sampled component, so its samples
+    // match the MCU dimensions).
+    let y_blocks_per_mcu = st.comp[0].h_samp as usize * st.comp[0].v_samp as usize;
+    let bytes_per_mcu_row = mcus_x * y_blocks_per_mcu * 64 * 2;
+    if bytes_per_mcu_row == 0 {
+        return Err("jpeg: empty MCU row");
+    }
+    let mut k = MAX_BAND_BYTES / bytes_per_mcu_row;
+    if k == 0 {
+        k = 1;
+    }
+    if k > mcus_y {
+        k = mcus_y;
+    }
+
+    log::info!(
+        "jpeg: progressive {}x{} → {}x{} (scale {}, K={}, band {} KB)",
+        w,
+        h,
+        out_w,
+        out_h,
+        scale,
+        k,
+        (k * bytes_per_mcu_row) / 1024
+    );
+
+    // band buffer (i16 quantized coefficients for Y blocks of K MCU rows)
+    let band_len = k * mcus_x * y_blocks_per_mcu * 64;
+    let mut band_y: Vec<i16> = Vec::new();
+    band_y
+        .try_reserve_exact(band_len)
+        .map_err(|_| "jpeg: OOM for progressive band")?;
+    band_y.resize(band_len, 0);
+
+    let mut y_row = Vec::new();
+    y_row
+        .try_reserve_exact(row_w * mcu_h)
+        .map_err(|_| "jpeg: OOM for y_row")?;
+    y_row.resize(row_w * mcu_h, 128u8);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(out_stride * out_h)
+        .map_err(|_| "jpeg: OOM for output")?;
+    output.resize(out_stride * out_h, 0u8);
+    let mut err_cur = Vec::new();
+    err_cur
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "jpeg: OOM for dither")?;
+    err_cur.resize(out_w + 2, 0i16);
+    let mut err_nxt = Vec::new();
+    err_nxt
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "jpeg: OOM for dither")?;
+    err_nxt.resize(out_w + 2, 0i16);
+
+    let first_sos = st.first_sos_offset;
+    let mut block_i32 = [0i32; 64];
+    let mut pix = [0u8; 64];
+    let mut out_y: usize = 0;
+
+    let band_count = (mcus_y + k - 1) / k;
+    for band_idx in 0..band_count {
+        let band_top = band_idx * k;
+        let band_bottom = (band_top + k).min(mcus_y);
+
+        // clear the band buffer; coefficients accumulate from zero
+        // across the scans of this pass.
+        let used = (band_bottom - band_top) * mcus_x * y_blocks_per_mcu * 64;
+        band_y[..used].fill(0);
+
+        // walk every scan in the file, seeking to the first SOS at
+        // the start of each band.
+        reader.seek(first_sos)?;
+        loop {
+            // we just consumed FF DA (either by parse_markers initially
+            // or by the previous scan's BitReader); parse the SOS
+            // segment header now.
+            parse_sos(&mut reader, &mut st)?;
+
+            let mut bit = BitReader::new(&mut reader);
+            let marker = walk_progressive_scan(
+                &mut bit,
+                &st,
+                &mut band_y,
+                band_top,
+                band_bottom,
+                mcus_x,
+                mcus_y,
+                y_blocks_per_mcu,
+            )?;
+            // bit dropped here, returning &mut reader
+
+            match marker {
+                M_EOI => break,
+                M_SOS => continue,
+                M_DHT => {
+                    // some encoders interleave Huffman tables between
+                    // scans; parse and continue scanning.
+                    parse_dht(&mut reader, &mut st)?;
+                    // next we expect another marker — keep looking
+                    // for FF, then a non-fill byte.
+                    let m = next_marker(&mut reader)?;
+                    if m == M_SOS {
+                        continue;
+                    }
+                    if m == M_EOI {
+                        break;
+                    }
+                    log::warn!("jpeg: unexpected marker after DHT: {:#x}", m);
+                    return Err("jpeg: unexpected marker between scans");
+                }
+                M_DQT | M_DRI => {
+                    // table updates between scans
+                    if marker == M_DQT {
+                        parse_dqt(&mut reader, &mut st)?;
+                    } else {
+                        parse_dri(&mut reader, &mut st)?;
+                    }
+                    let m = next_marker(&mut reader)?;
+                    if m == M_SOS {
+                        continue;
+                    }
+                    if m == M_EOI {
+                        break;
+                    }
+                    log::warn!("jpeg: unexpected marker after table update: {:#x}", m);
+                    return Err("jpeg: unexpected marker between scans");
+                }
+                0xC0..=0xCF => {
+                    log::warn!("jpeg: SOF mid-stream: {:#x}", marker);
+                    return Err("jpeg: unexpected SOF mid-stream");
+                }
+                _ => {
+                    // app/comment/DNL: skip the segment, then look for
+                    // the next real marker.
+                    skip_unknown_marker(&mut reader)?;
+                    let m = next_marker(&mut reader)?;
+                    if m == M_SOS {
+                        continue;
+                    }
+                    if m == M_EOI {
+                        break;
+                    }
+                    log::warn!("jpeg: unexpected marker after segment: {:#x}", m);
+                    return Err("jpeg: unexpected marker between scans");
+                }
+            }
+        }
+
+        // dequantize + IDCT each Y block in the band, blit to y_row
+        let qt = &st.qt[st.comp[0].qt_idx as usize];
+        y_row.fill(128);
+        let band_rows = band_bottom - band_top;
+        for my in 0..band_rows {
+            for mx in 0..mcus_x {
+                for bv in 0..st.max_v as usize {
+                    for bh in 0..st.max_h as usize {
+                        let bidx = bv * st.max_h as usize + bh;
+                        let off = band_block_offset(
+                            my,
+                            mx,
+                            bidx,
+                            mcus_x,
+                            y_blocks_per_mcu,
+                        );
+                        for kk in 0..64 {
+                            block_i32[kk] = (band_y[off + kk] as i32) * (qt[kk] as i32);
+                        }
+                        idct(&block_i32, &mut pix);
+                        let bx = mx * mcu_w + bh * 8;
+                        let by = bv * 8;
+                        for r in 0..8 {
+                            let dst = (by + r) * row_w + bx;
+                            y_row[dst..dst + 8].copy_from_slice(&pix[r * 8..r * 8 + 8]);
+                        }
+                    }
+                }
+            }
+
+            // dither this MCU row out
+            for py in 0..mcu_h {
+                let src_y = (band_top + my) * mcu_h + py;
+                if src_y >= h || out_y >= out_h {
+                    break;
+                }
+                if src_y % scale != 0 {
+                    continue;
+                }
+                let row_off = py * row_w;
+                let out_row = &mut output[out_y * out_stride..(out_y + 1) * out_stride];
+                dither_row_grey(
+                    &y_row[row_off..],
+                    scale,
+                    out_w,
+                    &mut err_cur,
+                    &mut err_nxt,
+                    out_row,
+                );
+                out_y += 1;
+                core::mem::swap(&mut err_cur, &mut err_nxt);
+                err_nxt.fill(0);
+            }
         }
     }
 
@@ -1059,6 +1790,7 @@ fn parse_sos<R: JpegRead>(r: &mut R, st: &mut JpegState) -> Result<(), &'static 
     st.scan_ss = r.read_byte()?.min(63);
     st.scan_se = r.read_byte()?.min(63);
     let ah_al = r.read_byte()?;
+    st.scan_ah = ah_al >> 4;
     st.scan_al = ah_al & 0x0F;
 
     skip_bytes(r, inner - need)
