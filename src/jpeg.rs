@@ -148,6 +148,16 @@ pub trait JpegRead {
     fn read_byte(&mut self) -> Result<u8, &'static str>;
     /// True when no more bytes are available from the source.
     fn is_eof(&self) -> bool;
+    /// Logical byte offset of the next byte to be read. Starts at 0
+    /// at construction and advances by 1 per `read_byte()`. Used by
+    /// the progressive decoder to record the first-SOS offset and
+    /// rewind to it for each band pass.
+    fn position(&self) -> u32;
+    /// Seek to absolute logical position `pos`. May seek backward
+    /// (used by the progressive decoder); on sources with expensive
+    /// reverse seeks (e.g. DEFLATE) this is supported but slow.
+    /// Returns `Err` if `pos` is past the end of the stream.
+    fn seek(&mut self, pos: u32) -> Result<(), &'static str>;
 }
 
 /// [`JpegRead`] backed by an in-memory slice.
@@ -178,6 +188,20 @@ impl JpegRead for SliceReader<'_> {
     fn is_eof(&self) -> bool {
         self.pos >= self.data.len()
     }
+
+    #[inline]
+    fn position(&self) -> u32 {
+        self.pos as u32
+    }
+
+    #[inline]
+    fn seek(&mut self, pos: u32) -> Result<(), &'static str> {
+        if (pos as usize) > self.data.len() {
+            return Err("jpeg: seek past end of data");
+        }
+        self.pos = pos as usize;
+        Ok(())
+    }
 }
 
 /// [`JpegRead`] backed by a chunked random-access source (typically SD).
@@ -187,6 +211,7 @@ impl JpegRead for SliceReader<'_> {
 /// bounds the byte range available from the source.
 pub struct ChunkReader<F> {
     read_fn: F,
+    start: u32,  // absolute offset of logical position 0
     offset: u32, // absolute offset of next byte to fetch
     end: u32,    // end-of-data offset (exclusive)
     buf: [u8; CHUNK_SIZE],
@@ -199,6 +224,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> ChunkReader<F> {
     pub fn new(read_fn: F, start: u32, end: u32) -> Self {
         Self {
             read_fn,
+            start,
             offset: start,
             end,
             buf: [0u8; CHUNK_SIZE],
@@ -241,6 +267,30 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> JpegRead for Chunk
     fn is_eof(&self) -> bool {
         self.pos >= self.len && self.offset >= self.end
     }
+
+    #[inline]
+    fn position(&self) -> u32 {
+        // self.buf[..self.len] currently holds source bytes
+        // [self.offset - self.len, self.offset); next byte to deliver
+        // sits at buffer index self.pos, so its source-absolute
+        // position is offset - len + pos. logical position is
+        // relative to self.start.
+        (self.offset - self.len as u32) + self.pos as u32 - self.start
+    }
+
+    fn seek(&mut self, pos: u32) -> Result<(), &'static str> {
+        let target = self
+            .start
+            .checked_add(pos)
+            .ok_or("jpeg: seek offset overflow")?;
+        if target > self.end {
+            return Err("jpeg: seek past end of data");
+        }
+        self.offset = target;
+        self.pos = 0;
+        self.len = 0;
+        Ok(())
+    }
 }
 
 /// Streaming DEFLATE-from-source [`JpegRead`].
@@ -251,6 +301,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> JpegRead for Chunk
 /// materialising the entire decompressed payload in memory.
 pub struct DeflateReader<F> {
     read_fn: F,
+    data_offset: u32, // original source offset (for rewind)
+    comp_size: usize, // original compressed size (for rewind)
     file_pos: u32,    // absolute offset of next compressed byte
     comp_left: usize, // compressed bytes remaining in ZIP entry
     rbuf: Vec<u8>,    // compressed-data read buffer
@@ -289,6 +341,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
 
         Ok(Self {
             read_fn,
+            data_offset,
+            comp_size: comp_size as usize,
             file_pos: data_offset,
             comp_left: comp_size as usize,
             rbuf,
@@ -300,6 +354,22 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
             avail: 0,
             done: false,
         })
+    }
+
+    // reset DEFLATE state to the start of the compressed stream.
+    // used by `seek` for backward seeks; forward seeks fall through
+    // to read_byte()-and-discard.
+    fn reset(&mut self) {
+        self.decomp.init();
+        self.file_pos = self.data_offset;
+        self.comp_left = self.comp_size;
+        self.in_avail = 0;
+        self.dict_pos = 0;
+        self.read_pos = 0;
+        self.avail = 0;
+        self.done = false;
+        // window contents are stale but irrelevant — miniz overwrites
+        // via dict_pos as it produces output.
     }
 
     // decompress more data into the circular window
@@ -386,6 +456,27 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> JpegRead for Defla
 
     fn is_eof(&self) -> bool {
         self.avail == 0 && self.done
+    }
+
+    #[inline]
+    fn position(&self) -> u32 {
+        self.read_pos as u32
+    }
+
+    fn seek(&mut self, pos: u32) -> Result<(), &'static str> {
+        let target = pos as usize;
+        if target < self.read_pos {
+            // backward seek: re-init DEFLATE state and replay forward.
+            self.reset();
+        }
+        // forward-skip from current position to target by discarding
+        // bytes. on a 32 KB sliding window this is cheap per byte but
+        // costs O(n) memory accesses; only used by progressive decode
+        // which is rare for DEFLATE-stored JPEGs.
+        while self.read_pos < target {
+            self.read_byte()?;
+        }
+        Ok(())
     }
 }
 
