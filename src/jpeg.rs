@@ -1123,6 +1123,27 @@ fn decode_progressive_block<R: JpegRead>(
     }
 }
 
+// skim entropy bytes of a scan we don't need (chroma AC refinement).
+// reads raw bytes from the source, handling FF 00 stuffing and RSTn
+// markers, until a non-RST marker is found. returns that marker.
+fn skim_scan_to_marker<R: JpegRead>(reader: &mut R) -> Result<u8, &'static str> {
+    loop {
+        let b = reader.read_byte()?;
+        if b != 0xFF {
+            continue;
+        }
+        loop {
+            let m = reader.read_byte()?;
+            match m {
+                0x00 => break,                    // byte stuffing — emitted as 0xFF data
+                0xFF => continue,                 // fill byte
+                M_RST0..=M_RST7 => break,         // mid-scan restart marker
+                _ => return Ok(m),                // real marker — scan is over
+            }
+        }
+    }
+}
+
 // walk one progressive scan to its terminating marker. returns the
 // non-RST marker code that ended the scan (M_SOS for next scan,
 // M_EOI for end of file).
@@ -1405,24 +1426,62 @@ fn decode_progressive<R: JpegRead>(
         // walk every scan in the file, seeking to the first SOS at
         // the start of each band.
         reader.seek(first_sos)?;
+        let mut scan_idx = 0usize;
         loop {
             // we just consumed FF DA (either by parse_markers initially
             // or by the previous scan's BitReader); parse the SOS
             // segment header now.
             parse_sos(&mut reader, &mut st)?;
+            log::debug!(
+                "jpeg: band {} scan {}: ss={} se={} ah={} al={} ncomp={}",
+                band_idx,
+                scan_idx,
+                st.scan_ss,
+                st.scan_se,
+                st.scan_ah,
+                st.scan_al,
+                st.scan_num_comp,
+            );
+            scan_idx += 1;
 
-            let mut bit = BitReader::new(&mut reader);
-            let marker = walk_progressive_scan(
-                &mut bit,
-                &st,
-                &mut band_y,
-                band_top,
-                band_bottom,
-                mcus_x,
-                mcus_y,
-                y_blocks_per_mcu,
-            )?;
-            // bit dropped here, returning &mut reader
+            // skim AC refinement scans whose blocks we can't refine
+            // with correct state: pac_refine reads existing nonzeros
+            // to determine the refinement bit count, so any block
+            // whose first-scan coefficients aren't resident corrupts
+            // the bitstream. we skim:
+            //   * any chroma AC refinement (we don't store chroma)
+            //   * Y AC refinement when K < mcus_y (out-of-band Y
+            //     blocks fall through to scratch, which has stale
+            //     state from prior scans)
+            // DC refinement reads exactly 1 bit per block regardless
+            // of state, so the desync doesn't apply there.
+            let is_ac_refine = st.scan_num_comp == 1
+                && st.scan_ah != 0
+                && st.scan_ss != 0;
+            let needs_skim = is_ac_refine
+                && (st.scan_order[0] != 0 || k < mcus_y);
+            let marker = if needs_skim {
+                log::debug!(
+                    "jpeg: skim ac-refine scan ci={} (k={} mcus_y={})",
+                    st.scan_order[0],
+                    k,
+                    mcus_y,
+                );
+                skim_scan_to_marker(&mut reader)?
+            } else {
+                let mut bit = BitReader::new(&mut reader);
+                walk_progressive_scan(
+                    &mut bit,
+                    &st,
+                    &mut band_y,
+                    band_top,
+                    band_bottom,
+                    mcus_x,
+                    mcus_y,
+                    y_blocks_per_mcu,
+                )?
+                // bit dropped here, returning &mut reader
+            };
 
             match marker {
                 M_EOI => break,

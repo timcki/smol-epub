@@ -150,27 +150,18 @@ fn progressive_moonbound_newsletter_decodes() {
     assert_eq!((w, h), (112, 67));
 }
 
-// known-failing for now: AC refinement scan trips on these fixtures.
-// keeping the test as a regression probe — switch the assertion to
-// `expect("must decode")` once the bug is fixed.
 #[test]
-fn progressive_moonbound_logo_pending() {
-    let r = try_decode(include_bytes!("fixtures/moonbound_logo.jpg"));
-    if let Ok((w, h)) = r {
-        assert_eq!((w, h), (246, 160));
-    } else {
-        eprintln!("moonbound_logo still failing: {r:?}");
-    }
+fn progressive_moonbound_logo_decodes() {
+    let (w, h) = try_decode(include_bytes!("fixtures/moonbound_logo.jpg"))
+        .expect("must decode");
+    assert_eq!((w, h), (246, 160));
 }
 
 #[test]
-fn progressive_moonbound_pg143_pending() {
-    let r = try_decode(include_bytes!("fixtures/moonbound_pg143.jpg"));
-    if let Ok((w, h)) = r {
-        // 860x533 → integer-downscaled by 2 to fit 600x800.
-        assert_eq!((w, h), (430, 266));
-    } else {
-        eprintln!("moonbound_pg143 still failing: {r:?}");
-    }
+fn progressive_moonbound_pg143_decodes() {
+    let (w, h) = try_decode(include_bytes!("fixtures/moonbound_pg143.jpg"))
+        .expect("must decode");
+    // 860x533 → integer-downscaled by 2 to fit 600x800.
+    assert_eq!((w, h), (430, 266));
 }
 
