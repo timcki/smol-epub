@@ -116,6 +116,9 @@ struct JpegState {
     scan_se: u8,
     // first-scan successive approximation low bit (point transform)
     scan_al: u8,
+    // logical position of the byte after the first SOS marker (FF DA);
+    // used by the progressive band loop to seek back to entropy start.
+    first_sos_offset: u32,
 }
 
 impl JpegState {
@@ -873,6 +876,10 @@ fn parse_markers<R: JpegRead>(r: &mut R) -> Result<Box<JpegState>, &'static str>
             M_DQT => parse_dqt(r, &mut st)?,
             M_DRI => parse_dri(r, &mut st)?,
             M_SOS => {
+                // record offset of the SOS segment header (right after
+                // the FF DA marker bytes) so the progressive decoder
+                // can seek back here for each band pass.
+                st.first_sos_offset = r.position();
                 parse_sos(r, &mut st)?;
                 return Ok(st);
             }
