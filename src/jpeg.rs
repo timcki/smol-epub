@@ -861,10 +861,13 @@ fn decode_baseline<R: JpegRead>(
 // baseline.
 
 // budget for the band coefficient buffer (i16, raw quantized).
-// 96 KB leaves ~50 KB heap headroom over the existing ~30 KB
-// baseline decode peak. note actual peak adds ~4 KB strip + dither
-// state and ~5 KB y_row, which the configured budget tolerates.
-const MAX_BAND_BYTES: usize = 96 * 1024;
+// this is a target, not a floor: decode_progressive halves K until
+// the reservation fits. 48 KB keeps the decode transient small
+// enough to coexist with the reader's typeset allocations on a
+// ~160 KB heap (96 KB bands drove the combined peak to ~157 KB and
+// starved concurrent Vec growth); the cost is proportionally more
+// passes over the entropy stream per image.
+const MAX_BAND_BYTES: usize = 48 * 1024;
 
 #[inline]
 fn band_block_offset(
@@ -1228,13 +1231,19 @@ fn walk_progressive_scan<R: JpegRead>(
     } else {
         // non-interleaved single-component scan: data units are blocks
         // of the single component, in raster order across the
-        // component's full block grid.
+        // component's OWN block grid: ceil(comp_samples/8) per axis
+        // (JPEG A.2.2), NOT the MCU-padded grid. for 4:2:0 Y the MCU
+        // grid is up to one block wider/taller; walking it over-reads
+        // the entropy stream and desyncs every later block (seen as
+        // "invalid Huffman code" on real files)
         let ci = st.scan_order[0] as usize;
         let c = &st.comp[ci];
         let dc_ht = &st.dc_huff[c.dc_tbl as usize];
         let ac_ht = &st.ac_huff[c.ac_tbl as usize];
-        let blocks_x = mcus_x * c.h_samp as usize;
-        let blocks_y = mcus_y * c.v_samp as usize;
+        let comp_w = (st.width as usize * c.h_samp as usize).div_ceil(st.max_h as usize);
+        let comp_h = (st.height as usize * c.v_samp as usize).div_ceil(st.max_v as usize);
+        let blocks_x = comp_w.div_ceil(8);
+        let blocks_y = comp_h.div_ceil(8);
         let total_blocks = (blocks_x * blocks_y) as u32;
         let mut blk_cnt: u32 = 0;
         for cy in 0..blocks_y {
@@ -1368,6 +1377,23 @@ fn decode_progressive<R: JpegRead>(
         k = mcus_y;
     }
 
+    // band buffer (i16 quantized coefficients for Y blocks of K MCU rows).
+    // allocated adaptively: MAX_BAND_BYTES is a target, not a requirement,
+    // so halve K until the reservation succeeds; smaller bands only cost
+    // extra passes over the entropy stream
+    let mut band_y: Vec<i16> = Vec::new();
+    loop {
+        let band_len = k * mcus_x * y_blocks_per_mcu * 64;
+        if band_y.try_reserve_exact(band_len).is_ok() {
+            band_y.resize(band_len, 0);
+            break;
+        }
+        if k == 1 {
+            return Err("jpeg: OOM for progressive band");
+        }
+        k /= 2;
+    }
+
     log::info!(
         "jpeg: progressive {}x{} → {}x{} (scale {}, K={}, band {} KB)",
         w,
@@ -1378,14 +1404,6 @@ fn decode_progressive<R: JpegRead>(
         k,
         (k * bytes_per_mcu_row) / 1024
     );
-
-    // band buffer (i16 quantized coefficients for Y blocks of K MCU rows)
-    let band_len = k * mcus_x * y_blocks_per_mcu * 64;
-    let mut band_y: Vec<i16> = Vec::new();
-    band_y
-        .try_reserve_exact(band_len)
-        .map_err(|_| "jpeg: OOM for progressive band")?;
-    band_y.resize(band_len, 0);
 
     let mut y_row = Vec::new();
     y_row

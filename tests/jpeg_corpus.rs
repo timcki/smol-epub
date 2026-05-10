@@ -165,3 +165,35 @@ fn progressive_moonbound_pg143_decodes() {
     assert_eq!((w, h), (430, 266));
 }
 
+
+// Exhalation (Ted Chiang) inline images: all progressive. 0001 was
+// the band-OOM regression; 0005 and 0010 failed on-device with
+// "invalid Huffman code".
+#[test]
+fn progressive_exhalation_inline_0001_decodes() {
+    let (w, h) =
+        try_decode(include_bytes!("fixtures/exhalation_inline_0001.jpg")).expect("must decode");
+    assert_eq!((w, h), (418, 269));
+}
+
+#[test]
+fn progressive_exhalation_inline_0005_decodes() {
+    let (w, h) =
+        try_decode(include_bytes!("fixtures/exhalation_inline_0005.jpg")).expect("must decode");
+    assert_eq!((w, h), (418, 269));
+}
+
+#[test]
+fn progressive_exhalation_inline_0010_decodes() {
+    let (w, h) =
+        try_decode(include_bytes!("fixtures/exhalation_inline_0010.jpg")).expect("must decode");
+    assert_eq!((w, h), (403, 266));
+}
+
+#[test]
+fn progressive_exhalation_cover_decodes() {
+    let (w, h) =
+        try_decode(include_bytes!("fixtures/exhalation_cover.jpg")).expect("must decode");
+    // 720x960 source, integer-downscaled by 2 to fit 600x800
+    assert_eq!((w, h), (360, 480));
+}
