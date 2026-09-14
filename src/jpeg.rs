@@ -682,6 +682,166 @@ fn validate_tables(st: &JpegState) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Horizontally-binned buffer for one MCU row of luma.
+///
+/// The decoder downscales by an integer `scale`, so only `out_w` of the
+/// `row_w` source columns reach the output. Materialising the band at
+/// full source width and then point-sampling one column in `scale` cost
+/// `row_w * mcu_h` bytes — 53 KB for a 6776 px wide image — and dropped
+/// any feature narrower than `scale` with probability `1 - width/scale`.
+///
+/// Instead each decoded block folds its pixels into the output column
+/// they land in, so the band is `out_w` wide and every source pixel
+/// contributes. That is both far smaller and a proper box filter: thin
+/// strokes survive as grey rather than appearing or vanishing depending
+/// on where they fell relative to the sampling grid.
+///
+/// `scale == 1` keeps byte-per-column storage, since binning would only
+/// widen each entry to `u16` for no gain on an image already inside the
+/// budget.
+struct Band {
+    // exactly one of these is non-empty
+    direct: Vec<u8>,   // scale == 1: source pixels
+    binned: Vec<u16>,  // scale >= 2: per-row horizontal sums
+    /// source columns folded into each output column. Zero where no
+    /// block covers the bin, which renders mid-grey the way the old
+    /// full-width `fill(128)` did.
+    col_n: Vec<u16>,
+    /// right shift applied to each sample before it enters `binned`,
+    /// so `scale * 255` cannot overflow a `u16` at extreme reductions.
+    shift: u8,
+    out_w: usize,
+    scale: usize,
+}
+
+impl Band {
+    fn new(
+        st: &JpegState,
+        w: usize,
+        scale: usize,
+        out_w: usize,
+        mcu_w: usize,
+        mcu_h: usize,
+        mcus_x: usize,
+    ) -> Result<Self, &'static str> {
+        // widest bin holds `scale` samples; keep the running sum inside u16
+        let mut shift = 0u8;
+        while ((scale >> shift) * 255) > u16::MAX as usize {
+            shift += 1;
+        }
+
+        let mut col_n: Vec<u16> = Vec::new();
+        col_n
+            .try_reserve_exact(out_w)
+            .map_err(|_| "jpeg: OOM for band")?;
+        col_n.resize(out_w, 0);
+        // walk the luma block grid once to learn how many source columns
+        // actually reach each bin: `scale` in the interior, fewer at the
+        // right edge, zero for bins no block covers
+        for mx in 0..mcus_x {
+            for bh in 0..st.comp[0].h_samp as usize {
+                let bx = mx * mcu_w + bh * 8;
+                for c in 0..8 {
+                    let sx = bx + c;
+                    if sx >= w {
+                        break;
+                    }
+                    let ox = sx / scale;
+                    if ox < out_w {
+                        col_n[ox] += 1;
+                    }
+                }
+            }
+        }
+
+        let mut direct = Vec::new();
+        let mut binned = Vec::new();
+        if scale == 1 {
+            direct
+                .try_reserve_exact(out_w * mcu_h)
+                .map_err(|_| "jpeg: OOM for band")?;
+            direct.resize(out_w * mcu_h, 0u8);
+        } else {
+            binned
+                .try_reserve_exact(out_w * mcu_h)
+                .map_err(|_| "jpeg: OOM for band")?;
+            binned.resize(out_w * mcu_h, 0u16);
+        }
+
+        Ok(Self {
+            direct,
+            binned,
+            col_n,
+            shift,
+            out_w,
+            scale,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.direct.fill(0);
+        self.binned.fill(0);
+    }
+
+    /// Fold one IDCT'd 8x8 luma block into the band. `bx` / `by` are the
+    /// block's source column / band-relative row.
+    fn scatter(&mut self, bx: usize, by: usize, w: usize, pix: &[u8; 64]) {
+        if self.scale == 1 {
+            // bins map 1:1 to source columns; clamp the MCU-grid overhang
+            // that used to land in the full-width band's padding
+            let n = 8.min(self.out_w.saturating_sub(bx));
+            if n == 0 {
+                return;
+            }
+            for r in 0..8 {
+                let dst = (by + r) * self.out_w + bx;
+                self.direct[dst..dst + n].copy_from_slice(&pix[r * 8..r * 8 + n]);
+            }
+            return;
+        }
+
+        // the block's 8 columns span at most two bins, so resolve them
+        // once here and reuse the mapping across all 8 rows
+        let mut bin = [usize::MAX; 8];
+        for (c, slot) in bin.iter_mut().enumerate() {
+            let sx = bx + c;
+            if sx >= w {
+                break;
+            }
+            let ox = sx / self.scale;
+            if ox < self.out_w {
+                *slot = ox;
+            }
+        }
+
+        for r in 0..8 {
+            let base = (by + r) * self.out_w;
+            let src = &pix[r * 8..r * 8 + 8];
+            for c in 0..8 {
+                let ox = bin[c];
+                if ox == usize::MAX {
+                    continue;
+                }
+                self.binned[base + ox] += (src[c] >> self.shift) as u16;
+            }
+        }
+    }
+
+    /// Add band row `py` into the vertical accumulator.
+    fn fold_row(&self, py: usize, acc: &mut [u32]) {
+        let lo = py * self.out_w;
+        if self.scale == 1 {
+            for (a, &v) in acc.iter_mut().zip(&self.direct[lo..lo + self.out_w]) {
+                *a += v as u32;
+            }
+        } else {
+            for (a, &v) in acc.iter_mut().zip(&self.binned[lo..lo + self.out_w]) {
+                *a += v as u32;
+            }
+        }
+    }
+}
+
 fn decode_baseline<R: JpegRead>(
     st: &JpegState,
     mut reader: BitReader<R>,
@@ -710,7 +870,6 @@ fn decode_baseline<R: JpegRead>(
     let mcu_h = st.max_v as usize * 8;
     let mcus_x = (w + mcu_w - 1) / mcu_w;
     let mcus_y = (h + mcu_h - 1) / mcu_h;
-    let row_w = mcus_x * mcu_w;
 
     log::info!(
         "jpeg: baseline {}x{} → {}x{} (scale {})",
@@ -723,16 +882,20 @@ fn decode_baseline<R: JpegRead>(
 
     // allocate buffers
 
-    let mut y_row = Vec::new();
-    y_row
-        .try_reserve_exact(row_w * mcu_h)
-        .map_err(|_| "jpeg: OOM for y_row")?;
-    y_row.resize(row_w * mcu_h, 128u8);
+    // output plane first: it is the biggest single reservation here
+    // and the only one that outlives the decode, so it gets the pick
+    // of the heap before the band splits a region it could have used
     let mut output = Vec::new();
     output
         .try_reserve_exact(out_stride * out_h)
         .map_err(|_| "jpeg: OOM for output")?;
     output.resize(out_stride * out_h, 0u8);
+    let mut band = Band::new(st, w, scale, out_w, mcu_w, mcu_h, mcus_x)?;
+    let mut acc_row: Vec<u32> = Vec::new();
+    acc_row
+        .try_reserve_exact(out_w)
+        .map_err(|_| "jpeg: OOM for band")?;
+    acc_row.resize(out_w, 0);
     let mut err_cur = Vec::new();
     err_cur
         .try_reserve_exact(out_w + 2)
@@ -753,8 +916,10 @@ fn decode_baseline<R: JpegRead>(
 
     // MCU decode loop
 
+    let mut rows_in_acc: u32 = 0;
+
     for mcu_row in 0..mcus_y {
-        y_row.fill(128);
+        band.clear();
 
         for mcu_col in 0..mcus_x {
             for sci in 0..st.scan_num_comp as usize {
@@ -776,12 +941,7 @@ fn decode_baseline<R: JpegRead>(
                                 st.scan_al,
                             )?;
                             idct(&block, &mut pix);
-                            let bx = mcu_col * mcu_w + bh * 8;
-                            let by = bv * 8;
-                            for r in 0..8 {
-                                let dst = (by + r) * row_w + bx;
-                                y_row[dst..dst + 8].copy_from_slice(&pix[r * 8..r * 8 + 8]);
-                            }
+                            band.scatter(mcu_col * mcu_w + bh * 8, bv * 8, w, &pix);
                         } else {
                             skip_block(
                                 &mut reader,
@@ -806,29 +966,47 @@ fn decode_baseline<R: JpegRead>(
             }
         }
 
-        // dither this MCU row
+        // fold this MCU row into the output grid, emitting a dithered
+        // row each time `scale` source rows have accumulated
         for py in 0..mcu_h {
             let src_y = mcu_row * mcu_h + py;
-            if src_y >= h || out_y >= out_h {
+            // rows past the last whole output row are dropped, as they
+            // were when only every `scale`-th row was sampled
+            if src_y >= h || src_y / scale >= out_h {
                 break;
             }
-            if src_y % scale != 0 {
-                continue;
+            band.fold_row(py, &mut acc_row);
+            rows_in_acc += 1;
+            if rows_in_acc as usize == scale {
+                emit_row(
+                    &acc_row,
+                    &band,
+                    rows_in_acc,
+                    &mut err_cur,
+                    &mut err_nxt,
+                    &mut output[out_y * out_stride..(out_y + 1) * out_stride],
+                );
+                out_y += 1;
+                core::mem::swap(&mut err_cur, &mut err_nxt);
+                err_nxt.fill(0);
+                acc_row.fill(0);
+                rows_in_acc = 0;
             }
-            let row_off = py * row_w;
-            let out_row = &mut output[out_y * out_stride..(out_y + 1) * out_stride];
-            dither_row_grey(
-                &y_row[row_off..],
-                scale,
-                out_w,
-                &mut err_cur,
-                &mut err_nxt,
-                out_row,
-            );
-            out_y += 1;
-            core::mem::swap(&mut err_cur, &mut err_nxt);
-            err_nxt.fill(0);
         }
+    }
+
+    // an image shorter than one output row (h < scale) leaves a partial
+    // accumulation with nothing to complete it
+    if rows_in_acc > 0 && out_y < out_h {
+        emit_row(
+            &acc_row,
+            &band,
+            rows_in_acc,
+            &mut err_cur,
+            &mut err_nxt,
+            &mut output[out_y * out_stride..(out_y + 1) * out_stride],
+        );
+        out_y += 1;
     }
 
     Ok(DecodedImage {
@@ -1359,7 +1537,6 @@ fn decode_progressive<R: JpegRead>(
     let mcu_h = st.max_v as usize * 8;
     let mcus_x = (w + mcu_w - 1) / mcu_w;
     let mcus_y = (h + mcu_h - 1) / mcu_h;
-    let row_w = mcus_x * mcu_w;
 
     // Y component is comp[0]; blocks-per-MCU for Y equals max_h * max_v
     // (Y is by convention the highest-sampled component, so its samples
@@ -1377,10 +1554,37 @@ fn decode_progressive<R: JpegRead>(
         k = mcus_y;
     }
 
+    // output plane first: it is the biggest single reservation here
+    // and the only one that outlives the decode, so it gets the pick
+    // of the heap before the band splits a region it could have used
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(out_stride * out_h)
+        .map_err(|_| "jpeg: OOM for output")?;
+    output.resize(out_stride * out_h, 0u8);
+    let mut band = Band::new(&st, w, scale, out_w, mcu_w, mcu_h, mcus_x)?;
+    let mut acc_row: Vec<u32> = Vec::new();
+    acc_row
+        .try_reserve_exact(out_w)
+        .map_err(|_| "jpeg: OOM for band")?;
+    acc_row.resize(out_w, 0);
+    let mut err_cur = Vec::new();
+    err_cur
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "jpeg: OOM for dither")?;
+    err_cur.resize(out_w + 2, 0i16);
+    let mut err_nxt = Vec::new();
+    err_nxt
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "jpeg: OOM for dither")?;
+    err_nxt.resize(out_w + 2, 0i16);
+
     // band buffer (i16 quantized coefficients for Y blocks of K MCU rows).
     // allocated adaptively: MAX_BAND_BYTES is a target, not a requirement,
     // so halve K until the reservation succeeds; smaller bands only cost
-    // extra passes over the entropy stream
+    // extra passes over the entropy stream.  it comes last because it is
+    // the only buffer here that can shrink: taking the 48 KB target before
+    // the fixed-size output starved that allocation on a tight heap
     let mut band_y: Vec<i16> = Vec::new();
     loop {
         let band_len = k * mcus_x * y_blocks_per_mcu * 64;
@@ -1405,31 +1609,11 @@ fn decode_progressive<R: JpegRead>(
         (k * bytes_per_mcu_row) / 1024
     );
 
-    let mut y_row = Vec::new();
-    y_row
-        .try_reserve_exact(row_w * mcu_h)
-        .map_err(|_| "jpeg: OOM for y_row")?;
-    y_row.resize(row_w * mcu_h, 128u8);
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(out_stride * out_h)
-        .map_err(|_| "jpeg: OOM for output")?;
-    output.resize(out_stride * out_h, 0u8);
-    let mut err_cur = Vec::new();
-    err_cur
-        .try_reserve_exact(out_w + 2)
-        .map_err(|_| "jpeg: OOM for dither")?;
-    err_cur.resize(out_w + 2, 0i16);
-    let mut err_nxt = Vec::new();
-    err_nxt
-        .try_reserve_exact(out_w + 2)
-        .map_err(|_| "jpeg: OOM for dither")?;
-    err_nxt.resize(out_w + 2, 0i16);
-
     let first_sos = st.first_sos_offset;
     let mut block_i32 = [0i32; 64];
     let mut pix = [0u8; 64];
     let mut out_y: usize = 0;
+    let mut rows_in_acc: u32 = 0;
 
     let band_count = (mcus_y + k - 1) / k;
     for band_idx in 0..band_count {
@@ -1558,11 +1742,15 @@ fn decode_progressive<R: JpegRead>(
             }
         }
 
-        // dequantize + IDCT each Y block in the band, blit to y_row
+        // dequantize + IDCT each Y block in the band, folding into the
+        // binned MCU-row buffer
         let qt = &st.qt[st.comp[0].qt_idx as usize];
-        y_row.fill(128);
         let band_rows = band_bottom - band_top;
         for my in 0..band_rows {
+            // one MCU row at a time: the band accumulates, so it has to
+            // start from zero for each (the old full-width buffer was
+            // overwritten wholesale and only needed filling once)
+            band.clear();
             for mx in 0..mcus_x {
                 for bv in 0..st.max_v as usize {
                     for bh in 0..st.max_h as usize {
@@ -1578,40 +1766,48 @@ fn decode_progressive<R: JpegRead>(
                             block_i32[kk] = (band_y[off + kk] as i32) * (qt[kk] as i32);
                         }
                         idct(&block_i32, &mut pix);
-                        let bx = mx * mcu_w + bh * 8;
-                        let by = bv * 8;
-                        for r in 0..8 {
-                            let dst = (by + r) * row_w + bx;
-                            y_row[dst..dst + 8].copy_from_slice(&pix[r * 8..r * 8 + 8]);
-                        }
+                        band.scatter(mx * mcu_w + bh * 8, bv * 8, w, &pix);
                     }
                 }
             }
 
-            // dither this MCU row out
+            // fold this MCU row into the output grid
             for py in 0..mcu_h {
                 let src_y = (band_top + my) * mcu_h + py;
-                if src_y >= h || out_y >= out_h {
+                if src_y >= h || src_y / scale >= out_h {
                     break;
                 }
-                if src_y % scale != 0 {
-                    continue;
+                band.fold_row(py, &mut acc_row);
+                rows_in_acc += 1;
+                if rows_in_acc as usize == scale {
+                    emit_row(
+                        &acc_row,
+                        &band,
+                        rows_in_acc,
+                        &mut err_cur,
+                        &mut err_nxt,
+                        &mut output[out_y * out_stride..(out_y + 1) * out_stride],
+                    );
+                    out_y += 1;
+                    core::mem::swap(&mut err_cur, &mut err_nxt);
+                    err_nxt.fill(0);
+                    acc_row.fill(0);
+                    rows_in_acc = 0;
                 }
-                let row_off = py * row_w;
-                let out_row = &mut output[out_y * out_stride..(out_y + 1) * out_stride];
-                dither_row_grey(
-                    &y_row[row_off..],
-                    scale,
-                    out_w,
-                    &mut err_cur,
-                    &mut err_nxt,
-                    out_row,
-                );
-                out_y += 1;
-                core::mem::swap(&mut err_cur, &mut err_nxt);
-                err_nxt.fill(0);
             }
         }
+    }
+
+    if rows_in_acc > 0 && out_y < out_h {
+        emit_row(
+            &acc_row,
+            &band,
+            rows_in_acc,
+            &mut err_cur,
+            &mut err_nxt,
+            &mut output[out_y * out_stride..(out_y + 1) * out_stride],
+        );
+        out_y += 1;
     }
 
     Ok(DecodedImage {
@@ -2166,19 +2362,26 @@ fn idct(block: &[i32; 64], out: &mut [u8; 64]) {
 
 // Floyd-Steinberg dithering
 
-// dither one row of Y pixels from the MCU row buffer inline
+// average one output row out of the accumulator and dither it inline.
+// `acc[ox]` holds the sum of every source pixel in the box that maps to
+// output column `ox`, over `n_row` source rows; dividing by the box's
+// sample count is the box filter.
 #[inline]
-fn dither_row_grey(
-    row: &[u8],
-    scale: usize,
-    out_w: usize,
+fn emit_row(
+    acc: &[u32],
+    band: &Band,
+    n_row: u32,
     err_cur: &mut [i16],
     err_nxt: &mut [i16],
     out_row: &mut [u8],
 ) {
-    for ox in 0..out_w {
-        let sx = ox * scale;
-        let g = row[sx] as i16;
+    for ox in 0..band.out_w {
+        let n = band.col_n[ox] as u32 * n_row;
+        // a bin no block covered keeps the mid-grey the full-width
+        // band used to supply via fill(128)
+        let g = acc[ox]
+            .checked_div(n)
+            .map_or(128i16, |avg| ((avg << band.shift).min(255)) as i16);
         let val = (g + err_cur[ox + 1]).clamp(0, 255);
         let black = val < 128;
         let q = if black { 0i16 } else { 255 };
