@@ -17,8 +17,11 @@ and images. smol-epub handles the full pipeline:
 - **xml** — minimal tag/attribute scanner for EPUB metadata
 - **css** — CSS property parser for EPUB stylesheets
 - **html_strip** — single-pass streaming HTML-to-styled-text converter;
-  emits inline style markers for bold, italic, headings, block quotes,
-  and image references
+  resolves the CSS cascade (tag defaults, the book's stylesheet, inline
+  style) and emits the `markup` encoding
+- **markup** — the styled-text encoding: inline toggles, one absolute
+  block record per paragraph, image references, and the `Events` decoder
+  every consumer walks the stream with
 - **cache** — chapter decompress-and-strip pipeline with cache metadata
 - **png** — PNG decoder → 1-bit Floyd–Steinberg dithered bitmap
 - **jpeg** — JPEG decoder → 1-bit Floyd–Steinberg dithered bitmap

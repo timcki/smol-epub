@@ -4,10 +4,18 @@
 //! reduced to the rightmost simple selector. `@`-rules and
 //! pseudo-classes are skipped.
 //!
-//! Rule table is stack-allocated: `MAX_CSS_RULES` × ~16 B = 2 KB.
+//! Rule table is stack-allocated: `MAX_CSS_RULES` × 18 B ≈ 4.5 KB.
+//!
+//! Only rules that carry at least one property the reader can act on
+//! are stored, so a Calibre stylesheet's hundreds of `.calibreN`
+//! font-family rules cost nothing.
 
 /// Maximum number of CSS rules the parser will store.
-pub const MAX_CSS_RULES: usize = 128;
+pub const MAX_CSS_RULES: usize = 256;
+
+/// Maximum number of classes considered from one `class="a b c"`
+/// attribute by [`CssRules::resolve_classes`].
+pub const MAX_ELEM_CLASSES: usize = 4;
 
 // ── property flag bits (which fields in StyleProps are explicitly set) ──
 
@@ -31,6 +39,8 @@ pub const PROP_MARGIN_BOTTOM: u16 = 1 << 7;
 pub const PROP_DISPLAY: u16 = 1 << 8;
 /// Flag: `text-decoration` is explicitly set.
 pub const PROP_TEXT_DECORATION: u16 = 1 << 9;
+/// Flag: `page-break-before` / `break-before` is explicitly set.
+pub const PROP_PAGE_BREAK: u16 = 1 << 10;
 
 // ── property value constants ────────────────────────────────────────
 
@@ -69,6 +79,11 @@ pub const TD_UNDERLINE: u8 = 1;
 /// `text-decoration: line-through`.
 pub const TD_LINE_THROUGH: u8 = 2;
 
+/// `page-break-before: auto` (no forced break).
+pub const PB_AUTO: u8 = 0;
+/// `page-break-before: always` / `break-before: page`.
+pub const PB_ALWAYS: u8 = 1;
+
 /// Resolved CSS properties for a single element.
 ///
 /// The `set` bitmask tracks which fields have been explicitly specified
@@ -98,6 +113,8 @@ pub struct StyleProps {
     pub display: u8,
     /// `text-decoration` bitmask — see [`TD_NONE`], [`TD_UNDERLINE`], etc.
     pub text_decoration: u8,
+    /// `page-break-before` — see [`PB_AUTO`], [`PB_ALWAYS`].
+    pub page_break_before: u8,
 }
 
 impl StyleProps {
@@ -114,7 +131,42 @@ impl StyleProps {
         margin_bottom: 0,
         display: DISP_DEFAULT,
         text_decoration: TD_NONE,
+        page_break_before: PB_AUTO,
     };
+
+    /// Parse the declarations of an inline `style="..."` attribute.
+    ///
+    /// Same property set as a stylesheet rule body; unknown
+    /// declarations are ignored.
+    pub fn parse_inline(style_attr: &[u8]) -> Self {
+        parse_declarations(style_attr)
+    }
+
+    /// Copy every property that `other` sets over this one,
+    /// regardless of specificity. This is the cascade between
+    /// origins: user-agent defaults, then the author stylesheet,
+    /// then the inline `style` attribute, each overlaid in turn.
+    pub fn overlay(&mut self, other: &Self) {
+        macro_rules! take {
+            ($field:ident, $bit:expr) => {
+                if other.set & $bit != 0 {
+                    self.$field = other.$field;
+                    self.set |= $bit;
+                }
+            };
+        }
+        take!(font_weight, PROP_FONT_WEIGHT);
+        take!(font_style, PROP_FONT_STYLE);
+        take!(text_align, PROP_TEXT_ALIGN);
+        take!(text_indent, PROP_TEXT_INDENT);
+        take!(margin_left, PROP_MARGIN_LEFT);
+        take!(margin_right, PROP_MARGIN_RIGHT);
+        take!(margin_top, PROP_MARGIN_TOP);
+        take!(margin_bottom, PROP_MARGIN_BOTTOM);
+        take!(display, PROP_DISPLAY);
+        take!(text_decoration, PROP_TEXT_DECORATION);
+        take!(page_break_before, PROP_PAGE_BREAK);
+    }
 
     // merge other's properties; only override if specificity >= best seen
     fn apply(&mut self, other: &Self, spec: u8, best: &mut [u8; 16]) {
@@ -137,6 +189,25 @@ impl StyleProps {
         merge!(margin_bottom, 7);
         merge!(display, 8);
         merge!(text_decoration, 9);
+        merge!(page_break_before, 10);
+    }
+
+    #[inline]
+    /// Returns `true` if `page-break-before` asks for a forced page break.
+    pub fn is_page_break_before(&self) -> bool {
+        self.set & PROP_PAGE_BREAK != 0 && self.page_break_before == PB_ALWAYS
+    }
+
+    #[inline]
+    /// Returns `true` if `text-decoration` includes an underline.
+    pub fn is_underline(&self) -> bool {
+        self.set & PROP_TEXT_DECORATION != 0 && self.text_decoration == TD_UNDERLINE
+    }
+
+    #[inline]
+    /// Returns `true` if `text-decoration` includes a line-through.
+    pub fn is_line_through(&self) -> bool {
+        self.set & PROP_TEXT_DECORATION != 0 && self.text_decoration == TD_LINE_THROUGH
     }
 
     #[inline]
@@ -179,6 +250,14 @@ impl Selector {
         let cls_ok = self.class_hash == 0 || self.class_hash == elem_class;
         tag_ok && cls_ok
     }
+
+    // like `matches` but the element may carry several classes; a
+    // class-constrained selector matches when any of them hashes equal
+    fn matches_any(&self, elem_tag: u8, classes: &[u16]) -> bool {
+        let tag_ok = self.tag == 0 || self.tag == elem_tag;
+        let cls_ok = self.class_hash == 0 || classes.contains(&self.class_hash);
+        tag_ok && cls_ok
+    }
 }
 
 // CssRule + CssRules
@@ -210,12 +289,21 @@ impl Default for CssRules {
 }
 
 impl CssRules {
+    /// A rule table with no rules; resolves every element to
+    /// [`StyleProps::EMPTY`]. Handy for callers without a stylesheet.
+    pub const EMPTY: Self = Self::new();
+
     /// Create an empty rule table.
     pub const fn new() -> Self {
         Self {
             rules: [CssRule::EMPTY; MAX_CSS_RULES],
             count: 0,
         }
+    }
+
+    /// Returns `true` once the table is full; later rules are dropped.
+    pub fn is_full(&self) -> bool {
+        self.count >= MAX_CSS_RULES
     }
 
     /// Remove all parsed rules.
@@ -306,6 +394,40 @@ impl CssRules {
             }
         }
 
+        result
+    }
+
+    /// Resolve the effective style for an element whose `class`
+    /// attribute may list several whitespace-separated classes.
+    ///
+    /// The first [`MAX_ELEM_CLASSES`] classes take part; rule order
+    /// still decides ties at equal specificity, as in a browser.
+    pub fn resolve_classes(&self, tag_name: &[u8], class_attr: &[u8]) -> StyleProps {
+        let tid = tag_id(tag_name);
+        let mut classes = [0u16; MAX_ELEM_CLASSES];
+        let mut n = 0usize;
+        for cls in class_attr.split(|&b| is_css_ws(b)) {
+            if cls.is_empty() {
+                continue;
+            }
+            if n == MAX_ELEM_CLASSES {
+                break;
+            }
+            classes[n] = class_hash(cls);
+            n += 1;
+        }
+
+        let mut result = StyleProps::EMPTY;
+        if self.count == 0 {
+            return result;
+        }
+        let mut best = [0u8; 16];
+        let classes = &classes[..n];
+        for rule in &self.rules[..self.count] {
+            if rule.sel.matches_any(tid, classes) {
+                result.apply(&rule.props, rule.sel.specificity, &mut best);
+            }
+        }
         result
     }
 
@@ -444,12 +566,16 @@ fn parse_property(name: &[u8], value: &[u8], props: &mut StyleProps) {
             props.font_weight = match value {
                 v if v.starts_with(b"bold") => FW_BOLD,
                 v if starts_with_digit(v) && parse_int(v) >= 600 => FW_BOLD,
+                v if v.starts_with(b"inherit") => return,
                 _ => FW_NORMAL,
             };
             props.set |= PROP_FONT_WEIGHT;
         }
 
         b"font-style" => {
+            if value.starts_with(b"inherit") {
+                return;
+            }
             props.font_style = if value.starts_with(b"italic") || value.starts_with(b"oblique") {
                 FS_ITALIC
             } else {
@@ -458,14 +584,44 @@ fn parse_property(name: &[u8], value: &[u8], props: &mut StyleProps) {
             props.set |= PROP_FONT_STYLE;
         }
 
+        // the `font` shorthand: `font: italic bold 1em/1.2 serif`. only the
+        // style and weight keywords ahead of the size matter to us
+        b"font" => {
+            for word in value.split(|&b| is_css_ws(b)) {
+                match word {
+                    b"italic" | b"oblique" => {
+                        props.font_style = FS_ITALIC;
+                        props.set |= PROP_FONT_STYLE;
+                    }
+                    b"bold" | b"bolder" => {
+                        props.font_weight = FW_BOLD;
+                        props.set |= PROP_FONT_WEIGHT;
+                    }
+                    w if starts_with_digit(w) => break,
+                    _ => {}
+                }
+            }
+        }
+
         b"text-align" => {
             props.text_align = match value {
                 v if v.starts_with(b"center") => TA_CENTER,
-                v if v.starts_with(b"right") => TA_RIGHT,
+                v if v.starts_with(b"right") || v.starts_with(b"end") => TA_RIGHT,
                 v if v.starts_with(b"justify") => TA_JUSTIFY,
+                v if v.starts_with(b"inherit") => return,
                 _ => TA_LEFT,
             };
             props.set |= PROP_TEXT_ALIGN;
+        }
+
+        b"page-break-before" | b"break-before" => {
+            props.page_break_before =
+                if value.starts_with(b"always") || value.starts_with(b"page") {
+                    PB_ALWAYS
+                } else {
+                    PB_AUTO
+                };
+            props.set |= PROP_PAGE_BREAK;
         }
 
         b"text-indent" => {
@@ -704,6 +860,11 @@ fn parse_length_qem(val: &[u8]) -> i8 {
         // 16px ~= 1em -> 4px ~= 1 qem
         let total_px_100 = whole * 100 + frac;
         (total_px_100 + 200) / 400
+    } else if unit.starts_with(b"%") {
+        // percent of the containing block, which on this reader's
+        // column is about 20 em wide, so 1% ~= 0.2 em = 0.8 qem
+        let total_pct_100 = whole * 100 + frac;
+        (total_pct_100 * 8 + 500) / 1000
     } else {
         // em, rem, or unknown: treat as em
         whole * 4 + (frac * 4 + 50) / 100

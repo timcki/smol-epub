@@ -34,6 +34,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use crate::css::CssRules;
 use crate::html_strip::HtmlStripStream;
 use crate::zip::{METHOD_DEFLATE, METHOD_STORED, ZipEntry, ZipIndex};
 
@@ -292,6 +293,7 @@ pub async fn stream_strip_entry_async<R: AsyncReadAt, W: AsyncWriteChunk>(
     local_offset: u32,
     reader: &mut R,
     writer: &mut W,
+    css: &CssRules,
 ) -> Result<u32, &'static str> {
     // skip local file header
     let mut header = [0u8; 30];
@@ -300,8 +302,8 @@ pub async fn stream_strip_entry_async<R: AsyncReadAt, W: AsyncWriteChunk>(
     let data_offset = local_offset + skip;
 
     match entry.method {
-        METHOD_STORED => stream_stored_async(entry, data_offset, reader, writer).await,
-        METHOD_DEFLATE => stream_deflate_async(entry, data_offset, reader, writer).await,
+        METHOD_STORED => stream_stored_async(entry, data_offset, reader, writer, css).await,
+        METHOD_DEFLATE => stream_deflate_async(entry, data_offset, reader, writer, css).await,
         _ => Err("cache: unsupported compression method"),
     }
 }
@@ -311,6 +313,7 @@ async fn stream_stored_async<R: AsyncReadAt, W: AsyncWriteChunk>(
     data_offset: u32,
     reader: &mut R,
     writer: &mut W,
+    css: &CssRules,
 ) -> Result<u32, &'static str> {
     let mut stripper = HtmlStripStream::new();
     let mut read_buf = [0u8; READ_BUF_SIZE];
@@ -339,6 +342,7 @@ async fn stream_stored_async<R: AsyncReadAt, W: AsyncWriteChunk>(
         feed_and_flush_async(
             &mut stripper,
             &read_buf[..n],
+            css,
             &mut strip_buf,
             &mut strip_pos,
             &mut total_written,
@@ -363,6 +367,7 @@ async fn stream_deflate_async<R: AsyncReadAt, W: AsyncWriteChunk>(
     data_offset: u32,
     reader: &mut R,
     writer: &mut W,
+    css: &CssRules,
 ) -> Result<u32, &'static str> {
     use miniz_oxide::inflate::TINFLStatus;
     use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
@@ -450,6 +455,7 @@ async fn stream_deflate_async<R: AsyncReadAt, W: AsyncWriteChunk>(
             feed_and_flush_async(
                 &mut stripper,
                 &window[old_out_pos..end],
+                css,
                 &mut strip_buf,
                 &mut strip_pos,
                 &mut total_written,
@@ -508,7 +514,7 @@ async fn stream_deflate_async<R: AsyncReadAt, W: AsyncWriteChunk>(
 ///
 /// Strips HTML from already-decompressed XHTML, yielding periodically
 /// during processing.  Returns the styled plain text.
-pub async fn strip_html_buf_async(xhtml: &[u8]) -> Result<Vec<u8>, &'static str> {
+pub async fn strip_html_buf_async(xhtml: &[u8], css: &CssRules) -> Result<Vec<u8>, &'static str> {
     let mut out = Vec::new();
     out.try_reserve_exact(xhtml.len())
         .map_err(|_| "cache: OOM for strip buffer")?;
@@ -519,7 +525,7 @@ pub async fn strip_html_buf_async(xhtml: &[u8]) -> Result<Vec<u8>, &'static str>
     let mut iterations: u32 = 0;
 
     while ip < xhtml.len() {
-        let (consumed, written) = stripper.feed(&xhtml[ip..], &mut tmp);
+        let (consumed, written) = stripper.feed(&xhtml[ip..], &mut tmp, css);
         if written > 0 {
             out.extend_from_slice(&tmp[..written]);
         }
@@ -567,6 +573,7 @@ async fn read_all_async<R: AsyncReadAt>(
 async fn feed_and_flush_async<W: AsyncWriteChunk>(
     stripper: &mut HtmlStripStream,
     input: &[u8],
+    css: &CssRules,
     strip_buf: &mut [u8; STRIP_BUF_SIZE],
     strip_pos: &mut usize,
     total_written: &mut u32,
@@ -586,6 +593,7 @@ async fn feed_and_flush_async<W: AsyncWriteChunk>(
         let (consumed, written) = stripper.feed(
             &input[ip..],
             &mut strip_buf[*strip_pos..*strip_pos + avail_out],
+            css,
         );
         ip += consumed;
         *strip_pos += written;

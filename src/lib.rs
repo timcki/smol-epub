@@ -15,6 +15,7 @@
 //! | [`css`] | CSS property parser for EPUB stylesheets |
 //! | [`epub`] | EPUB structure: `container.xml` → OPF → spine / metadata / TOC |
 //! | [`html_strip`] | Single-pass, streaming HTML-to-styled-text converter |
+//! | [`markup`] | The styled-text encoding: marker constants and the `Events` decoder |
 //! | [`cache`] | Chapter decompress-and-strip pipeline with cache metadata |
 //! | [`png`] | PNG decoder → 1-bit Floyd–Steinberg dithered bitmap *(feature `images`)* |
 //! | [`jpeg`] | JPEG decoder → 1-bit Floyd–Steinberg dithered bitmap *(feature `images`)* |
@@ -82,6 +83,7 @@ pub mod cache;
 pub mod css;
 pub mod epub;
 pub mod html_strip;
+pub mod markup;
 pub mod xml;
 pub mod zip;
 

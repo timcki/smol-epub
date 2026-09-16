@@ -1,119 +1,43 @@
 //! Single-pass HTML to styled-text converter for EPUB XHTML.
 //!
-//! [`HtmlStripStream`]: streaming `feed`/`finish` interface; emits 2-byte
-//! `[MARKER, tag]` style codes inline with plain text.
+//! [`HtmlStripStream`]: streaming `feed`/`finish` interface; emits the
+//! [`crate::markup`] encoding: plain UTF-8 text with two-byte style
+//! toggles, a block record per paragraph and image references.
 //!
-//! [`strip_html_inplace`]: in-place variant for `container.xml` / OPF / TOC.
+//! Styling is resolved here, once, at strip time. Every open tag goes
+//! through the cascade `user-agent defaults < book stylesheet < inline
+//! style`, and an element stack records what each open changed so its
+//! close restores exactly that: nested `<b><span class="bold">` does
+//! not emit a premature bold-off, `font-weight: normal` inside bold
+//! turns bold off and back on, and an inline tag left open is unwound
+//! by the block that closes over it.
 //!
-//! Marker encoding: `[0x01, tag]`. Inline: `B`/`b` `I`/`i`.
-//! Block: `H`/`h` `Q`/`q` `S` (hr). Image: `P` (path follows).
+//! [`strip_html_inplace`]: in-place variant for `container.xml` / OPF /
+//! TOC, plain text only.
 
 use alloc::vec::Vec;
 
-/// Escape byte that introduces a 2-byte style marker in the output stream.
-pub const MARKER: u8 = 0x01;
-
-/// Style tag: bold **on** (`[MARKER, BOLD_ON]`).
-pub const BOLD_ON: u8 = b'B';
-/// Style tag: bold **off** (`[MARKER, BOLD_OFF]`).
-pub const BOLD_OFF: u8 = b'b';
-/// Style tag: italic **on** (`[MARKER, ITALIC_ON]`).
-pub const ITALIC_ON: u8 = b'I';
-/// Style tag: italic **off** (`[MARKER, ITALIC_OFF]`).
-pub const ITALIC_OFF: u8 = b'i';
-/// Style tag: heading **on** (legacy, level-agnostic; aliased to [`H2_ON`]).
-///
-/// Emitted only by [`strip_html_inplace`] which doesn't track heading levels.
-/// New code should prefer the per-level [`H1_ON`]..[`H6_ON`].
-pub const HEADING_ON: u8 = b'H';
-/// Style tag: heading **off** (legacy, aliased to [`H2_OFF`]).
-pub const HEADING_OFF: u8 = b'h';
-/// Style tag: block-quote **on** (`[MARKER, QUOTE_ON]`).
-pub const QUOTE_ON: u8 = b'Q';
-/// Style tag: block-quote **off** (`[MARKER, QUOTE_OFF]`).
-pub const QUOTE_OFF: u8 = b'q';
-
-/// Style tag: thematic break / horizontal rule (`[MARKER, BREAK]`).
-pub const BREAK: u8 = b'S';
-/// Style tag: inline image reference (`[MARKER, IMG_REF, len, path…]`).
-pub const IMG_REF: u8 = b'P';
-
-// per-level heading markers; the consumer translates these into a heading
-// tier so h1..h6 can render distinctly without further bytes per line.
-/// Style tag: `<h1>` open.
-pub const H1_ON: u8 = b'1';
-/// Style tag: `<h1>` close.
-pub const H1_OFF: u8 = b'!';
-/// Style tag: `<h2>` open.
-pub const H2_ON: u8 = b'2';
-/// Style tag: `<h2>` close.
-pub const H2_OFF: u8 = b'@';
-/// Style tag: `<h3>` open.
-pub const H3_ON: u8 = b'3';
-/// Style tag: `<h3>` close.
-pub const H3_OFF: u8 = b'#';
-/// Style tag: `<h4>` open.
-pub const H4_ON: u8 = b'4';
-/// Style tag: `<h4>` close.
-pub const H4_OFF: u8 = b'$';
-/// Style tag: `<h5>` open.
-pub const H5_ON: u8 = b'5';
-/// Style tag: `<h5>` close.
-pub const H5_OFF: u8 = b'%';
-/// Style tag: `<h6>` open.
-pub const H6_ON: u8 = b'6';
-/// Style tag: `<h6>` close.
-pub const H6_OFF: u8 = b'^';
-
-/// Style tag: underline **on** (`<u>`, `<ins>`).
-pub const UNDERLINE_ON: u8 = b'U';
-/// Style tag: underline **off**.
-pub const UNDERLINE_OFF: u8 = b'u';
-/// Style tag: strike-through **on** (`<s>`, `<strike>`, `<del>`).
-pub const STRIKE_ON: u8 = b'K';
-/// Style tag: strike-through **off**.
-pub const STRIKE_OFF: u8 = b'k';
-
-// alignment markers; emitted by tag-keyed defaults (h1/h2/figcaption)
-// and by inline `style="text-align:..."`. ALIGN_RESET restores the
-// reader's default (typically justify) when a block closes.
-/// Style tag: align left.
-pub const ALIGN_LEFT: u8 = b'L';
-/// Style tag: align center.
-pub const ALIGN_CENTER: u8 = b'C';
-/// Style tag: align right.
-pub const ALIGN_RIGHT: u8 = b'R';
-/// Style tag: justify (full).
-pub const ALIGN_JUSTIFY: u8 = b'J';
-/// Style tag: reset alignment to the reader's default.
-pub const ALIGN_RESET: u8 = b'X';
-
-/// Style tag: end the current page; resume on a fresh page.
-///
-/// Emitted before `<h1>` (chapter break) and for blocks carrying
-/// `page-break-before: always`.
-pub const PAGE_BREAK: u8 = b'F';
-
-/// Style tag: figure caption open.
-pub const FIGCAPTION_ON: u8 = b'G';
-/// Style tag: figure caption close.
-pub const FIGCAPTION_OFF: u8 = b'g';
-
-/// Returns `true` if `b` is the [`MARKER`] escape byte.
-#[inline]
-pub const fn is_marker(b: u8) -> bool {
-    b == MARKER
-}
+use crate::css::{self, CssRules, StyleProps};
+pub use crate::markup::{
+    is_marker, BLOCK, BLOCK_LEN, BOLD_OFF, BOLD_ON, BREAK, H1_OFF, H1_ON, H2_OFF, H2_ON, H3_OFF,
+    H3_ON, H4_OFF, H4_ON, H5_OFF, H5_ON, H6_OFF, H6_ON, IMG_FLAG_BLOCK, IMG_FLAG_FIGURE,
+    IMG_HEADER_LEN, IMG_REF, ITALIC_OFF, ITALIC_ON, MARKER, PAGE_BREAK, STRIKE_OFF, STRIKE_ON,
+    UNDERLINE_OFF, UNDERLINE_ON,
+};
+use crate::markup::{Align, BlockProps};
 
 const TAG_BUF_CAP: usize = 16;
 const ENTITY_BUF_CAP: usize = 12;
 const BANG_BUF_CAP: usize = 8;
-const PENDING_CAP: usize = 32;
-// holds queued deferred bytes flushed before the next text byte. tag-keyed
-// defaults can stack several open markers (e.g. <h1> emits PAGE_BREAK +
-// ALIGN_CENTER + H1_ON = 6 bytes; nested <li> bullet adds 4 UTF-8 bytes;
-// inline <b><i> add 4 more) so 32 is sized for the worst realistic stack.
+// close-side bytes: unwinding a block over several open inline tags
+// emits up to five off markers per element
+const PENDING_CAP: usize = 64;
+// holds queued deferred bytes flushed before the next text byte: a
+// heading marker, up to four inline on/off markers, the `<li>` bullet
 const DEFERRED_CAP: usize = 32;
+const CLASS_CAP: usize = 64;
+const STYLE_VAL_CAP: usize = 96;
+const ELEM_STACK_CAP: usize = 16;
 
 // img_src layout during <img> attribute capture:
 //   [0..9)                 reserved for the marker header, filled at finish
@@ -125,19 +49,9 @@ const DEFERRED_CAP: usize = 32;
 // post-compaction length is at most IMG_SRC_CAP, which keeps img_w (u8)
 // usable as the drain cursor.
 const IMG_SRC_CAP: usize = 192;
-/// Length of the IMG_REF marker header (the bytes preceding alt + path):
-/// `[MARKER, IMG_REF, flags, w_lo, w_hi, h_lo, h_hi, alt_len, path_len]`.
-pub const IMG_HEADER_LEN: usize = 9;
 const IMG_ALT_CAP: usize = 48;
 const IMG_PATH_OFFSET: usize = IMG_HEADER_LEN + IMG_ALT_CAP;
 const IMG_PATH_CAP: usize = IMG_SRC_CAP - IMG_PATH_OFFSET;
-
-// IMG_REF flags byte (in the marker payload)
-const IMG_FLAG_FIGURE: u8 = 1 << 0; // image is the canonical content of a <figure>
-// reserved: explicit "force block" hint (e.g. from inline `display: block`)
-// not yet emitted by the stripper; the consumer keeps the bit reserved.
-#[allow(dead_code)]
-const IMG_FLAG_BLOCK: u8 = 1 << 1;
 
 // captured <img> attribute kinds
 const IMG_ATTR_NONE: u8 = 0;
@@ -145,6 +59,30 @@ const IMG_ATTR_SRC: u8 = 1;
 const IMG_ATTR_ALT: u8 = 2;
 const IMG_ATTR_WIDTH: u8 = 3;
 const IMG_ATTR_HEIGHT: u8 = 4;
+
+// captured element attribute kinds
+const ATTR_NONE: u8 = 0;
+const ATTR_CLASS: u8 = 1;
+const ATTR_STYLE: u8 = 2;
+
+// inline style bits, shared by `inline_state` and `Elem::{changed, prev}`
+const INLINE_BOLD: u8 = 1 << 0;
+const INLINE_ITALIC: u8 = 1 << 1;
+const INLINE_UNDERLINE: u8 = 1 << 2;
+const INLINE_STRIKE: u8 = 1 << 3;
+
+// `Elem::kind` bits
+const ELEM_BLOCK: u8 = 1 << 0;
+const ELEM_HIDDEN: u8 = 1 << 1;
+const ELEM_FIGURE: u8 = 1 << 2;
+const ELEM_CELL: u8 = 1 << 3;
+
+// `pending_breaks` bits, flushed ahead of the block record
+const PEND_THEMATIC: u8 = 1 << 0;
+const PEND_PAGE: u8 = 1 << 1;
+
+const H_ON: [u8; 7] = [0, H1_ON, H2_ON, H3_ON, H4_ON, H5_ON, H6_ON];
+const H_OFF: [u8; 7] = [0, H1_OFF, H2_OFF, H3_OFF, H4_OFF, H5_OFF, H6_OFF];
 
 // state machine phases
 #[derive(Clone, Copy, PartialEq)]
@@ -170,51 +108,54 @@ enum Phase {
     ImgValStart,
     ImgSrcVal,
     ImgSkipVal,
-    // attribute scan for style-aware block tags (p, div, h1-h6, blockquote,
-    // figure). same shape as the Img* states but only the `style` attribute
-    // is captured; other attributes are skipped.
-    StyleAttrLook,
-    StyleAttrName,
-    StyleAttrGap,
-    StyleValStart,
-    StyleValBody,
-    StyleValSkip,
+    // attribute scan for every other open tag. same shape as the Img*
+    // states; only `class` and `style` are captured, other attributes
+    // are skipped.
+    AttrLook,
+    AttrName,
+    AttrGap,
+    ValStart,
+    ValBody,
+    ValSkip,
 }
 
-// per-tag identifier for the alignment-restore stack. only style-aware tags
-// are tracked, so e.g. an inner <span> doesn't pop a parent's alignment.
-const STYLE_TAG_NONE: u8 = 0;
-const STYLE_TAG_P: u8 = 1;
-const STYLE_TAG_DIV: u8 = 2;
-const STYLE_TAG_H1: u8 = 3;
-const STYLE_TAG_H2: u8 = 4;
-const STYLE_TAG_H3: u8 = 5;
-const STYLE_TAG_H4: u8 = 6;
-const STYLE_TAG_H5: u8 = 7;
-const STYLE_TAG_H6: u8 = 8;
-const STYLE_TAG_BLOCKQUOTE: u8 = 9;
-const STYLE_TAG_FIGURE: u8 = 10;
+// one open element. records what its open changed so the close can
+// restore it, and the block state in force before it opened.
+#[derive(Clone, Copy)]
+struct Elem {
+    // css::class_hash of the lowercase tag name, for close matching
+    tag: u16,
+    // INLINE_* bits this element toggled, and their previous values
+    changed: u8,
+    prev: u8,
+    // 1..=6 when this element emitted a heading marker
+    heading: u8,
+    kind: u8,
+    // effective block state before this element opened
+    prev_align: u8,
+    prev_left: u8,
+    prev_indent: u8,
+    // bottom margin in quarter-em, collapsed into the next gap on close
+    margin_bottom: u8,
+    // deferred queue length and generation when this element opened
+    dmark: u8,
+    dgen: u8,
+}
 
-const STYLE_VAL_CAP: usize = 96;
-const ALIGN_STACK_CAP: usize = 8;
-
-// classify a tag name as one of the style-aware kinds, or STYLE_TAG_NONE.
-// the alignment stack only pushes/pops for matching kinds, so non-aware
-// tags like <span> don't perturb the depth.
-fn style_aware_kind(tag: &[u8]) -> u8 {
-    match tag {
-        b"p" => STYLE_TAG_P,
-        b"div" => STYLE_TAG_DIV,
-        b"h1" => STYLE_TAG_H1,
-        b"h2" => STYLE_TAG_H2,
-        b"h3" => STYLE_TAG_H3,
-        b"h4" => STYLE_TAG_H4,
-        b"h5" => STYLE_TAG_H5,
-        b"h6" => STYLE_TAG_H6,
-        b"blockquote" => STYLE_TAG_BLOCKQUOTE,
-        b"figure" => STYLE_TAG_FIGURE,
-        _ => STYLE_TAG_NONE,
-    }
+impl Elem {
+    const EMPTY: Self = Self {
+        tag: 0,
+        changed: 0,
+        prev: 0,
+        heading: 0,
+        kind: 0,
+        prev_align: 0,
+        prev_left: 0,
+        prev_indent: 0,
+        margin_bottom: 0,
+        dmark: 0,
+        dgen: 0,
+    };
 }
 
 impl Default for HtmlStripStream {
@@ -223,19 +164,24 @@ impl Default for HtmlStripStream {
     }
 }
 
-/// Stateful, streaming HTML-to-styled-text converter (~80 bytes of state).
+/// Stateful, streaming HTML-to-styled-text converter.
 ///
 /// Feed chunks of EPUB XHTML via [`feed`](Self::feed), then call
 /// [`finish`](Self::finish) to flush any trailing state. The output is
-/// plain text interspersed with 2-byte `[MARKER, tag]` style codes.
+/// the [`crate::markup`] encoding. The stylesheet is passed to every
+/// `feed` call rather than stored, so the stream carries no lifetime.
 pub struct HtmlStripStream {
     phase: Phase,
 
-    // tag name accumulation
+    // tag name accumulation (also reused for attribute names)
     tag_buf: [u8; TAG_BUF_CAP],
     tag_len: u8,
     is_close_tag: bool,
     enter_skip: bool, // tag is skip-content; enter SkipContent on >
+
+    // the element name being opened, kept while its attributes scan
+    elem_buf: [u8; TAG_BUF_CAP],
+    elem_len: u8,
 
     // entity accumulation
     entity_buf: [u8; ENTITY_BUF_CAP],
@@ -257,14 +203,13 @@ pub struct HtmlStripStream {
     trailing_nl: u8, // deferred newlines; flushed before next visible byte; capped at 2
     has_output: bool, // true once any visible char emitted; suppresses leading whitespace
 
-    // deferred open-style markers; open-tag markers (bold on, heading on, etc.)
-    // appear AFTER paragraph-break newlines and BEFORE text.
-    // close-tag markers go to `pending` immediately (before paragraph newlines).
+    // deferred open-side bytes (heading marker, inline toggles, bullet);
+    // they appear after the paragraph prefix and before the text.
+    // close-side markers go to `pending` immediately.
     deferred: [u8; DEFERRED_CAP],
     deferred_len: u8,
 
-    // pending output: bytes queued by classify_tag or queue_text not yet
-    // drained to the caller's output slice
+    // pending output: bytes queued but not yet drained to the caller
     pending: [u8; PENDING_CAP],
     pend_w: u8,
     pend_r: u8,
@@ -281,24 +226,35 @@ pub struct HtmlStripStream {
     img_attr_kind: u8,   // IMG_ATTR_NONE / SRC / ALT / WIDTH / HEIGHT
     capture_img: bool,   // true while inside <img> tag body
     img_quote: u8,       // active quote char in attribute value
-    in_figure: bool,     // currently between <figure> and </figure>
+    in_figure: u8,       // open <figure> depth
 
-    // inline style="..." capture for style-aware block tags. mutually
-    // exclusive with capture_img (a <img> tag isn't a style-aware kind).
-    capture_style: bool,
+    // class="..." / style="..." capture for every other open tag
+    capture_attrs: bool,
+    attr_kind: u8,
+    attr_quote: u8,
+    self_closing: bool, // saw `/` right before `>`
+    class_buf: [u8; CLASS_CAP],
+    class_w: u8,
     style_val_buf: [u8; STYLE_VAL_CAP],
     style_val_w: u8,
-    style_attr_match: bool, // current attribute name == "style"
-    style_quote: u8,
 
-    // alignment override stack: each entry stores {tag_kind, saved_align}
-    // packed as `(kind << 8) | saved_align_byte`. push when an open emits
-    // ALIGN_*; pop on the matching close emits the saved alignment.
-    align_stack: [u16; ALIGN_STACK_CAP],
-    align_stack_depth: u8,
-    // last alignment marker byte we asked the consumer to apply. starts at
-    // ALIGN_RESET so a top-level pop restores the reader's default.
-    current_inline_align: u8,
+    // element stack
+    stack: [Elem; ELEM_STACK_CAP],
+    depth: u8,
+    // INLINE_* bits currently in force in the output
+    inline_state: u8,
+    // effective block state (inherited through the stack)
+    cur_align: u8,
+    cur_left: u8,
+    cur_indent: u8,
+    // collapsed margin waiting for the next paragraph, quarter-em
+    pending_space: u8,
+    pending_breaks: u8,
+    // bumped every time the deferred queue is flushed, so a close can
+    // tell whether its open-side bytes went out yet
+    deferred_gen: u8,
+    // number of open elements inside a display:none subtree
+    hidden_depth: u8,
 }
 
 impl HtmlStripStream {
@@ -310,6 +266,8 @@ impl HtmlStripStream {
             tag_len: 0,
             is_close_tag: false,
             enter_skip: false,
+            elem_buf: [0u8; TAG_BUF_CAP],
+            elem_len: 0,
             entity_buf: [0u8; ENTITY_BUF_CAP],
             entity_len: 0,
             skip_target: None,
@@ -336,23 +294,34 @@ impl HtmlStripStream {
             img_attr_kind: IMG_ATTR_NONE,
             capture_img: false,
             img_quote: 0,
-            in_figure: false,
-            capture_style: false,
+            in_figure: 0,
+            capture_attrs: false,
+            attr_kind: ATTR_NONE,
+            attr_quote: 0,
+            self_closing: false,
+            class_buf: [0u8; CLASS_CAP],
+            class_w: 0,
             style_val_buf: [0u8; STYLE_VAL_CAP],
             style_val_w: 0,
-            style_attr_match: false,
-            style_quote: 0,
-            align_stack: [0u16; ALIGN_STACK_CAP],
-            align_stack_depth: 0,
-            current_inline_align: ALIGN_RESET,
+            stack: [Elem::EMPTY; ELEM_STACK_CAP],
+            depth: 0,
+            inline_state: 0,
+            cur_align: 0,
+            cur_left: 0,
+            cur_indent: 0,
+            pending_space: 0,
+            pending_breaks: 0,
+            deferred_gen: 0,
+            hidden_depth: 0,
         }
     }
 
-    /// Process a chunk of HTML input.
+    /// Process a chunk of HTML input against the book's stylesheet
+    /// (pass [`CssRules::EMPTY`] when there is none).
     ///
     /// Returns `(consumed, written)`. If `consumed < input.len()`, call
     /// again with the remaining input (the output buffer was full).
-    pub fn feed(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize) {
+    pub fn feed(&mut self, input: &[u8], output: &mut [u8], css: &CssRules) -> (usize, usize) {
         let ilen = input.len();
         let olen = output.len();
         let mut ip: usize = 0;
@@ -397,10 +366,11 @@ impl HtmlStripStream {
             match self.phase {
                 // normal text
                 Phase::Text => {
-                    if b == MARKER {
-                        // literal 0x01 in source; drop silently (SOH never in real EPUBs)
-                    } else if b == b'<' {
+                    if b == b'<' {
                         self.phase = Phase::AfterLt;
+                    } else if self.hidden_depth > 0 || b == MARKER {
+                        // inside display:none, or a literal 0x01 in the
+                        // source (SOH never appears in real EPUBs): drop
                     } else if b == b'&' {
                         self.entity_len = 0;
                         self.phase = Phase::Entity;
@@ -451,15 +421,18 @@ impl HtmlStripStream {
                         if b == b'>' {
                             if self.capture_img {
                                 self.finish_img_tag();
-                            } else if self.capture_style {
-                                self.finish_style_tag();
+                            } else if self.capture_attrs {
+                                self.finish_elem_tag(css);
                             } else {
                                 self.finish_tag();
                             }
                         } else if self.capture_img {
                             self.phase = Phase::ImgBody;
-                        } else if self.capture_style {
-                            self.phase = Phase::StyleAttrLook;
+                        } else if self.capture_attrs {
+                            if b == b'/' {
+                                self.self_closing = true;
+                            }
+                            self.phase = Phase::AttrLook;
                         } else {
                             self.phase = Phase::TagBody;
                         }
@@ -566,109 +539,106 @@ impl HtmlStripStream {
                     }
                 }
 
-                // attribute scan for style-aware tags. mirrors the Img*
-                // pipeline: name accumulator -> '=' -> value capture or
-                // skip. only the `style` attribute is captured; everything
-                // else funnels through StyleValSkip.
-                Phase::StyleAttrLook => {
+                // attribute scan for every other open tag: name accumulator
+                // -> '=' -> value capture (class / style) or skip. a `/`
+                // right before `>` marks the element self-closing.
+                Phase::AttrLook => {
                     if b == b'>' {
-                        self.finish_style_tag();
+                        self.finish_elem_tag(css);
+                    } else if b == b'/' {
+                        self.self_closing = true;
                     } else if b.is_ascii_alphabetic() || b == b'_' {
-                        self.tag_len = 0;
+                        self.self_closing = false;
                         self.tag_buf[0] = b.to_ascii_lowercase();
                         self.tag_len = 1;
-                        self.phase = Phase::StyleAttrName;
+                        self.phase = Phase::AttrName;
                     }
-                    // whitespace, '/', etc: stay
+                    // whitespace: stay
                 }
 
-                Phase::StyleAttrName => {
+                Phase::AttrName => {
                     if b == b'=' {
-                        let name = &self.tag_buf[..self.tag_len as usize];
-                        self.style_attr_match = name == b"style";
-                        self.phase = Phase::StyleValStart;
+                        self.classify_attr();
+                        self.phase = Phase::ValStart;
                     } else if b == b'>' {
-                        self.finish_style_tag();
-                    } else if is_html_ws(b) || b == b'/' {
-                        self.phase = Phase::StyleAttrGap;
+                        self.finish_elem_tag(css);
+                    } else if b == b'/' {
+                        self.self_closing = true;
+                        self.phase = Phase::AttrGap;
+                    } else if is_html_ws(b) {
+                        self.phase = Phase::AttrGap;
                     } else if (self.tag_len as usize) < TAG_BUF_CAP {
                         self.tag_buf[self.tag_len as usize] = b.to_ascii_lowercase();
                         self.tag_len += 1;
                     }
                 }
 
-                Phase::StyleAttrGap => {
+                Phase::AttrGap => {
                     if b == b'=' {
-                        let name = &self.tag_buf[..self.tag_len as usize];
-                        self.style_attr_match = name == b"style";
-                        self.phase = Phase::StyleValStart;
+                        self.classify_attr();
+                        self.phase = Phase::ValStart;
                     } else if b == b'>' {
-                        self.finish_style_tag();
+                        self.finish_elem_tag(css);
+                    } else if b == b'/' {
+                        self.self_closing = true;
                     } else if b.is_ascii_alphabetic() || b == b'_' {
-                        self.tag_len = 0;
+                        self.self_closing = false;
                         self.tag_buf[0] = b.to_ascii_lowercase();
                         self.tag_len = 1;
-                        self.phase = Phase::StyleAttrName;
+                        self.phase = Phase::AttrName;
                     }
-                    // whitespace, '/': stay
+                    // whitespace: stay
                 }
 
-                Phase::StyleValStart => {
+                Phase::ValStart => {
                     if b == b'"' || b == b'\'' {
-                        self.style_quote = b;
-                        self.phase = if self.style_attr_match {
-                            Phase::StyleValBody
+                        self.attr_quote = b;
+                        self.phase = if self.attr_kind != ATTR_NONE {
+                            Phase::ValBody
                         } else {
-                            Phase::StyleValSkip
+                            Phase::ValSkip
                         };
                     } else if b == b'>' {
-                        self.finish_style_tag();
+                        self.finish_elem_tag(css);
                     } else if !is_html_ws(b) {
-                        self.style_quote = 0;
-                        if self.style_attr_match {
-                            let pos = self.style_val_w as usize;
-                            if pos < STYLE_VAL_CAP {
-                                self.style_val_buf[pos] = b;
-                                self.style_val_w += 1;
-                            }
-                            self.phase = Phase::StyleValBody;
+                        // unquoted value: this byte is already part of it
+                        self.attr_quote = 0;
+                        if self.attr_kind != ATTR_NONE {
+                            self.capture_attr_byte(b);
+                            self.phase = Phase::ValBody;
                         } else {
-                            self.phase = Phase::StyleValSkip;
+                            self.phase = Phase::ValSkip;
                         }
                     }
                 }
 
-                Phase::StyleValBody => {
-                    let done = if self.style_quote != 0 {
-                        b == self.style_quote
+                Phase::ValBody => {
+                    let done = if self.attr_quote != 0 {
+                        b == self.attr_quote
                     } else {
-                        is_html_ws(b) || b == b'>' || b == b'/'
+                        is_html_ws(b) || b == b'>'
                     };
                     if done {
-                        self.style_attr_match = false;
-                        self.phase = Phase::StyleAttrLook;
-                        if self.style_quote == 0 && b == b'>' {
-                            self.finish_style_tag();
+                        self.attr_kind = ATTR_NONE;
+                        self.phase = Phase::AttrLook;
+                        if self.attr_quote == 0 && b == b'>' {
+                            self.finish_elem_tag(css);
                         }
                     } else {
-                        let pos = self.style_val_w as usize;
-                        if pos < STYLE_VAL_CAP {
-                            self.style_val_buf[pos] = b;
-                            self.style_val_w += 1;
-                        }
+                        self.capture_attr_byte(b);
                     }
                 }
 
-                Phase::StyleValSkip => {
-                    let done = if self.style_quote != 0 {
-                        b == self.style_quote
+                Phase::ValSkip => {
+                    let done = if self.attr_quote != 0 {
+                        b == self.attr_quote
                     } else {
-                        is_html_ws(b) || b == b'>' || b == b'/'
+                        is_html_ws(b) || b == b'>'
                     };
                     if done {
-                        self.phase = Phase::StyleAttrLook;
-                        if self.style_quote == 0 && b == b'>' {
-                            self.finish_style_tag();
+                        self.phase = Phase::AttrLook;
+                        if self.attr_quote == 0 && b == b'>' {
+                            self.finish_elem_tag(css);
                         }
                     }
                 }
@@ -918,27 +888,60 @@ impl HtmlStripStream {
         }
     }
 
-    // queue visible text byte; flush deferred newlines and style markers first
+    // queue visible text byte; the paragraph prefix goes out first
     fn queue_text(&mut self, b: u8) {
-        // deferred newlines
-        if self.has_output && self.trailing_nl > 0 {
-            let nl = self.trailing_nl;
-            for _ in 0..nl {
+        self.flush_prefix();
+        self.push_pending(b);
+        self.last_was_space = false;
+        self.has_output = true;
+    }
+
+    // everything that precedes a paragraph's first text byte, in stream
+    // order: deferred newlines, thematic / page breaks, the block record,
+    // then the deferred open-side bytes (heading marker, inline toggles,
+    // bullet). the block record is skipped when the paragraph has default
+    // properties, and after a single `\n` (a `<br>` continuation)
+    fn flush_prefix(&mut self) {
+        let para_start = !self.has_output || self.trailing_nl >= 2;
+        if self.has_output {
+            for _ in 0..self.trailing_nl {
                 self.push_pending(b'\n');
             }
         }
         self.trailing_nl = 0;
 
-        // deferred open-style markers
+        if self.pending_breaks & PEND_THEMATIC != 0 {
+            self.push_pending(MARKER);
+            self.push_pending(BREAK);
+        }
+        if self.pending_breaks & PEND_PAGE != 0 {
+            self.push_pending(MARKER);
+            self.push_pending(PAGE_BREAK);
+        }
+        self.pending_breaks = 0;
+
+        if para_start {
+            let block = BlockProps {
+                align: Align::from_bits(self.cur_align),
+                left: self.cur_left,
+                text_indent_qem: self.cur_indent,
+                // no space above the first paragraph of a chapter
+                space_above_qem: if self.has_output { self.pending_space } else { 0 },
+            };
+            if !block.is_default() {
+                for &x in block.encode().iter() {
+                    self.push_pending(x);
+                }
+            }
+        }
+        self.pending_space = 0;
+
         let dlen = self.deferred_len as usize;
         for i in 0..dlen {
             self.push_pending(self.deferred[i]);
         }
         self.deferred_len = 0;
-
-        self.push_pending(b);
-        self.last_was_space = false;
-        self.has_output = true;
+        self.deferred_gen = self.deferred_gen.wrapping_add(1);
     }
 
     // handle whitespace byte; collapse runs to a single space
@@ -975,125 +978,72 @@ impl HtmlStripStream {
         // encode to UTF-8 and queue each byte
         let mut tmp = [0u8; 4];
         let n = encode_codepoint_utf8(cp, &mut tmp);
-        for i in 0..n {
-            self.queue_text(tmp[i]);
+        for &byte in tmp.iter().take(n) {
+            self.queue_text(byte);
         }
     }
 
-    // classify accumulated tag name; push close markers to pending, open to deferred
+    // classify the accumulated tag name: close tags unwind the element
+    // stack, void tags act at once, every other open tag goes on to
+    // attribute capture and is resolved in `finish_elem_tag`
     fn classify_tag(&mut self) {
         // copy tag name to a local to avoid borrowing self.tag_buf
-        // while mutating self through push_pending / push_deferred
+        // while mutating self
         let mut tn = [0u8; TAG_BUF_CAP];
-        let tn_len = self.tag_len as usize;
-        tn[..tn_len].copy_from_slice(&self.tag_buf[..tn_len]);
-        let name = &tn[..tn_len];
-        let is_close = self.is_close_tag;
+        let n = self.tag_len as usize;
+        tn[..n].copy_from_slice(&self.tag_buf[..n]);
+        let name = &tn[..n];
 
-        // skip-content tags (script/style/head); open only
-        if !is_close && let Some(sk) = SkipTag::from_name(name) {
+        if self.is_close_tag {
+            self.close_elem(name);
+            return;
+        }
+
+        // skip-content tags (script/style/head)
+        if let Some(sk) = SkipTag::from_name(name) {
             self.skip_target = Some(sk);
             self.enter_skip = true;
+            return;
         }
 
-        // close-tag markers go out immediately (before deferred newlines)
-        if is_close && let Some(m) = close_style_tag(name) {
-            self.push_pending(MARKER);
-            self.push_pending(m);
-        }
-
-        // tag-keyed close defaults; emit alignment reset / supporting style
-        // off for tags that introduced an override on open. order: after the
-        // primary close marker so heading-off precedes alignment-reset.
-        if is_close {
-            for &b in tag_default_close(name) {
-                self.push_pending(b);
+        match name {
+            b"br" => {
+                if self.hidden_depth == 0 {
+                    self.trailing_nl = self.trailing_nl.saturating_add(1).min(2);
+                    self.last_was_space = true;
+                }
             }
-        }
-
-        // block elements set deferred paragraph breaks
-        if is_block_element(name) {
-            self.trailing_nl = self.trailing_nl.max(2);
-            self.last_was_space = true;
-        }
-
-        // tag-keyed open defaults: PAGE_BREAK / ALIGN_* / bullet, queued
-        // before the natural style marker so e.g. PAGE_BREAK -> ALIGN_CENTER
-        // -> H1_ON -> text matches the visual order required by the wrapper.
-        if !is_close {
-            self.push_deferred_bytes(tag_default_open(name));
-        }
-
-        // open-tag markers are deferred (after newlines, before text);
-        // inline markers too: <p><b>text -> \n\n[B]text, not [B]\n\ntext
-        if !is_close && let Some(m) = open_style_tag(name) {
-            self.push_deferred_marker(m);
-        }
-
-        // <br>: line break
-        if name == b"br" {
-            self.trailing_nl = self.trailing_nl.saturating_add(1).min(2);
-            self.last_was_space = true;
-        }
-
-        // <hr>: scene break marker (deferred)
-        if name == b"hr" && !is_close {
-            self.push_deferred_marker(BREAK);
-        }
-
-        // <figure>: track depth so <img> inside marks itself as figure-content
-        if name == b"figure" {
-            self.in_figure = !is_close;
-        }
-
-        // <img>: enter image-attribute capture mode; reset accumulators
-        if name == b"img" && !is_close {
-            self.capture_img = true;
-            self.img_w = 0;
-            self.img_alt_w = 0;
-            self.img_w_attr = 0;
-            self.img_h_attr = 0;
-            self.img_num = 0;
-            self.img_attr_kind = IMG_ATTR_NONE;
-            self.img_flags = if self.in_figure { IMG_FLAG_FIGURE } else { 0 };
-        }
-
-        // style-aware open: enter attribute scan to look for style="..." and
-        // push a placeholder onto align_stack. finish_style_tag will set the
-        // saved-align byte if an inline override was found; otherwise it
-        // stays 0, which means "no emit on pop".
-        if !is_close {
-            let kind = style_aware_kind(name);
-            if kind != STYLE_TAG_NONE {
-                self.capture_style = true;
+            b"hr" => {
+                if self.hidden_depth == 0 {
+                    self.trailing_nl = 2;
+                    self.last_was_space = true;
+                    self.pending_breaks |= PEND_THEMATIC;
+                    self.pending_space = self.pending_space.max(2);
+                }
+            }
+            b"img" => {
+                self.capture_img = true;
+                self.img_w = 0;
+                self.img_alt_w = 0;
+                self.img_w_attr = 0;
+                self.img_h_attr = 0;
+                self.img_num = 0;
+                self.img_attr_kind = IMG_ATTR_NONE;
+                self.img_flags = if self.in_figure > 0 {
+                    IMG_FLAG_FIGURE
+                } else {
+                    0
+                };
+            }
+            _ if is_void_element(name) => {}
+            _ => {
+                self.elem_buf[..n].copy_from_slice(name);
+                self.elem_len = n as u8;
+                self.capture_attrs = true;
+                self.attr_kind = ATTR_NONE;
+                self.class_w = 0;
                 self.style_val_w = 0;
-                self.style_attr_match = false;
-                if (self.align_stack_depth as usize) < ALIGN_STACK_CAP {
-                    let entry: u16 = (kind as u16) << 8; // saved_align = 0
-                    self.align_stack[self.align_stack_depth as usize] = entry;
-                    self.align_stack_depth += 1;
-                }
-            }
-        }
-
-        // style-aware close: pop the matching entry. saved_align == 0 means
-        // the open didn't override alignment and we emit nothing. otherwise
-        // emit the saved align marker and update current_inline_align so
-        // future overrides nest correctly.
-        if is_close {
-            let kind = style_aware_kind(name);
-            if kind != STYLE_TAG_NONE && self.align_stack_depth > 0 {
-                let top = self.align_stack[self.align_stack_depth as usize - 1];
-                let top_kind = (top >> 8) as u8;
-                let saved_align = (top & 0xff) as u8;
-                if top_kind == kind {
-                    self.align_stack_depth -= 1;
-                    if saved_align != 0 {
-                        self.current_inline_align = saved_align;
-                        self.push_pending(MARKER);
-                        self.push_pending(saved_align);
-                    }
-                }
+                self.self_closing = false;
             }
         }
     }
@@ -1108,34 +1058,273 @@ impl HtmlStripStream {
         }
     }
 
-    // finish a style-aware open tag. parses the captured `style="..."` value
-    // for text-align and, if present, emits the corresponding ALIGN_* marker
-    // and stamps the saved alignment onto the top of `align_stack` so the
-    // matching close pops it back out. classify_tag already pushed the
-    // placeholder entry for this open.
-    fn finish_style_tag(&mut self) {
-        self.capture_style = false;
-
-        let val = &self.style_val_buf[..self.style_val_w as usize];
-        if let Some(align_byte) = parse_text_align(val) {
-            // record the align we'll restore on close, packed into the top
-            // align_stack entry. depth must be > 0 since classify_tag pushed.
-            if self.align_stack_depth > 0 {
-                let depth = self.align_stack_depth as usize - 1;
-                let kind = (self.align_stack[depth] >> 8) as u8;
-                let entry = ((kind as u16) << 8) | self.current_inline_align as u16;
-                self.align_stack[depth] = entry;
-            }
-            self.push_deferred_marker(align_byte);
-            self.current_inline_align = align_byte;
-        }
-
-        self.style_val_w = 0;
-        self.style_attr_match = false;
+    // the open tag's attributes are in; resolve and open the element
+    fn finish_elem_tag(&mut self, css: &CssRules) {
+        self.capture_attrs = false;
+        self.attr_kind = ATTR_NONE;
+        let self_closing = self.self_closing;
+        self.self_closing = false;
         self.phase = Phase::Text;
+
+        let mut name = [0u8; TAG_BUF_CAP];
+        let n = self.elem_len as usize;
+        name[..n].copy_from_slice(&self.elem_buf[..n]);
+        self.open_elem(&name[..n], css);
+        if self_closing {
+            self.close_elem(&name[..n]);
+        }
     }
 
-    // identify the captured attribute name (in tag_buf) and update img_attr_kind.
+    // identify the captured attribute name (in tag_buf)
+    fn classify_attr(&mut self) {
+        let name = &self.tag_buf[..self.tag_len as usize];
+        self.attr_kind = match name {
+            b"class" => ATTR_CLASS,
+            b"style" => ATTR_STYLE,
+            _ => ATTR_NONE,
+        };
+    }
+
+    fn capture_attr_byte(&mut self, b: u8) {
+        match self.attr_kind {
+            ATTR_CLASS => {
+                let w = self.class_w as usize;
+                if w < CLASS_CAP {
+                    self.class_buf[w] = b;
+                    self.class_w += 1;
+                }
+            }
+            ATTR_STYLE => {
+                let w = self.style_val_w as usize;
+                if w < STYLE_VAL_CAP {
+                    self.style_val_buf[w] = b;
+                    self.style_val_w += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // resolve the cascade for an open tag and emit what changes
+    fn open_elem(&mut self, name: &[u8], css: &CssRules) {
+        let mut e = Elem {
+            tag: css::class_hash(name),
+            dmark: self.deferred_len,
+            dgen: self.deferred_gen,
+            ..Elem::EMPTY
+        };
+
+        // inside a hidden subtree nothing is emitted; the element is
+        // pushed only so its close keeps the stack balanced
+        if self.hidden_depth > 0 {
+            e.kind = ELEM_HIDDEN;
+            if self.push_elem(e) {
+                self.hidden_depth += 1;
+            }
+            return;
+        }
+
+        let mut props = ua_defaults(name);
+        if !css.is_empty() {
+            let class = &self.class_buf[..self.class_w as usize];
+            props.overlay(&css.resolve_classes(name, class));
+        }
+        if self.style_val_w > 0 {
+            let inline = &self.style_val_buf[..self.style_val_w as usize];
+            props.overlay(&StyleProps::parse_inline(inline));
+        }
+
+        if props.is_hidden() {
+            e.kind = ELEM_HIDDEN;
+            if self.push_elem(e) {
+                self.hidden_depth += 1;
+            }
+            return;
+        }
+
+        let is_block = if props.set & css::PROP_DISPLAY == 0 {
+            is_block_element(name)
+        } else {
+            match props.display {
+                css::DISP_BLOCK => true,
+                css::DISP_INLINE => false,
+                _ => is_block_element(name),
+            }
+        };
+
+        if is_block {
+            e.kind |= ELEM_BLOCK;
+            self.trailing_nl = self.trailing_nl.max(2);
+            self.last_was_space = true;
+            if props.set & css::PROP_MARGIN_TOP != 0 {
+                self.pending_space = self.pending_space.max(qem_u8(props.margin_top));
+            }
+            if props.set & css::PROP_MARGIN_BOTTOM != 0 {
+                e.margin_bottom = qem_u8(props.margin_bottom);
+            }
+            e.prev_align = self.cur_align;
+            e.prev_left = self.cur_left;
+            e.prev_indent = self.cur_indent;
+            if props.set & css::PROP_TEXT_ALIGN != 0 {
+                self.cur_align = match props.text_align {
+                    css::TA_LEFT => Align::Left as u8,
+                    css::TA_CENTER => Align::Center as u8,
+                    css::TA_RIGHT => Align::Right as u8,
+                    _ => Align::Default as u8,
+                };
+            }
+            if props.set & css::PROP_MARGIN_LEFT != 0 && props.margin_left > 0 {
+                // one indent level per whole em, rounded
+                let levels = (props.margin_left as u8 + 2) / 4;
+                self.cur_left = (self.cur_left + levels).min(BlockProps::LEFT_MAX);
+            }
+            if props.set & css::PROP_TEXT_INDENT != 0 {
+                // hanging (negative) indents are not supported: flush left
+                self.cur_indent = qem_u8(props.text_indent);
+            }
+            if props.is_page_break_before() {
+                self.pending_breaks |= PEND_PAGE;
+            }
+        }
+
+        match name {
+            b"figure" => {
+                self.in_figure = self.in_figure.saturating_add(1);
+                e.kind |= ELEM_FIGURE;
+            }
+            b"td" | b"th" => e.kind |= ELEM_CELL,
+            _ => {}
+        }
+
+        let lvl = heading_level(name);
+        if lvl != 0 {
+            e.heading = lvl;
+            self.push_deferred_marker(H_ON[lvl as usize]);
+        }
+
+        // inline flags: emit only transitions, remember what to restore
+        let td = props.set & css::PROP_TEXT_DECORATION != 0;
+        let wants = [
+            (INLINE_BOLD, props.set & css::PROP_FONT_WEIGHT != 0, props.is_bold()),
+            (INLINE_ITALIC, props.set & css::PROP_FONT_STYLE != 0, props.is_italic()),
+            (INLINE_UNDERLINE, td, props.is_underline()),
+            (INLINE_STRIKE, td, props.is_line_through()),
+        ];
+        for (bit, specified, on) in wants {
+            if !specified {
+                continue;
+            }
+            let have = self.inline_state & bit != 0;
+            if have == on {
+                continue;
+            }
+            e.changed |= bit;
+            if have {
+                e.prev |= bit;
+            }
+            self.inline_state ^= bit;
+            self.push_deferred_marker(inline_marker(bit, on));
+        }
+
+        if name == b"li" {
+            self.push_deferred_bytes("\u{2022} ".as_bytes());
+        }
+
+        self.push_elem(e);
+    }
+
+    // returns false when the stack is full and the element was dropped;
+    // a dropped element's close is then ignored by `close_elem`
+    fn push_elem(&mut self, e: Elem) -> bool {
+        let d = self.depth as usize;
+        if d >= ELEM_STACK_CAP {
+            return false;
+        }
+        self.stack[d] = e;
+        self.depth += 1;
+        true
+    }
+
+    // pop the nearest open element with this name, unwinding anything
+    // left open above it (an unclosed inline tag ends with its block).
+    // a close with no matching open is ignored
+    fn close_elem(&mut self, name: &[u8]) {
+        let tag = css::class_hash(name);
+        let mut found = None;
+        for i in (0..self.depth as usize).rev() {
+            if self.stack[i].tag == tag {
+                found = Some(i);
+                break;
+            }
+        }
+        let Some(target) = found else {
+            return;
+        };
+        while self.depth as usize > target {
+            self.depth -= 1;
+            let e = self.stack[self.depth as usize];
+            self.unwind(e);
+        }
+    }
+
+    // emit the close side of one element and restore the state it changed
+    fn unwind(&mut self, e: Elem) {
+        if e.kind & ELEM_HIDDEN != 0 {
+            self.hidden_depth = self.hidden_depth.saturating_sub(1);
+            return;
+        }
+
+        // nothing was emitted since this element opened (empty or
+        // self-closing): its open-side bytes are still queued, so drop
+        // them rather than closing what never went out
+        let unflushed = e.dgen == self.deferred_gen;
+        if unflushed {
+            self.deferred_len = e.dmark;
+        }
+
+        if e.heading != 0 && !unflushed {
+            self.push_pending(MARKER);
+            self.push_pending(H_OFF[e.heading as usize]);
+        }
+
+        for bit in [INLINE_BOLD, INLINE_ITALIC, INLINE_UNDERLINE, INLINE_STRIKE] {
+            if e.changed & bit == 0 {
+                continue;
+            }
+            let on = e.prev & bit != 0;
+            if on {
+                self.inline_state |= bit;
+            } else {
+                self.inline_state &= !bit;
+            }
+            if !unflushed {
+                self.push_pending(MARKER);
+                self.push_pending(inline_marker(bit, on));
+            }
+        }
+
+        if e.kind & ELEM_FIGURE != 0 {
+            self.in_figure = self.in_figure.saturating_sub(1);
+        }
+
+        if e.kind & ELEM_CELL != 0 {
+            // cells of one row run on inline; keep a space between them
+            if self.has_output && self.trailing_nl == 0 && !self.last_was_space {
+                self.push_pending(b' ');
+                self.last_was_space = true;
+            }
+        }
+
+        if e.kind & ELEM_BLOCK != 0 {
+            self.trailing_nl = self.trailing_nl.max(2);
+            self.last_was_space = true;
+            self.pending_space = self.pending_space.max(e.margin_bottom);
+            self.cur_align = e.prev_align;
+            self.cur_left = e.prev_left;
+            self.cur_indent = e.prev_indent;
+        }
+    }
+
     // closes out any digit value pending from a previous attribute.
     fn classify_img_attr(&mut self) {
         // commit any in-flight numeric value before switching attribute
@@ -1222,6 +1411,7 @@ impl HtmlStripStream {
         }
     }
 
+
     // finish <img> tag; emit image-ref marker if src was captured
     fn finish_img_tag(&mut self) {
         // commit any in-flight numeric value (e.g. unquoted width="123")
@@ -1233,26 +1423,13 @@ impl HtmlStripStream {
         let alt_len = self.img_alt_w as usize;
         self.capture_img = false;
 
-        if path_len > 0 {
-            // block break before image (image is treated as block-level until
-            // the consumer demotes it to inline based on dimensions)
+        if path_len > 0 && self.hidden_depth == 0 {
+            // an image is its own block (the consumer demotes it to inline
+            // based on dimensions); it takes the paragraph prefix like text
             if self.has_output {
                 self.trailing_nl = self.trailing_nl.max(2);
             }
-            // emit deferred newlines
-            if self.has_output && self.trailing_nl > 0 {
-                let nl = self.trailing_nl;
-                for _ in 0..nl {
-                    self.push_pending(b'\n');
-                }
-            }
-            self.trailing_nl = 0;
-            // flush deferred open-style markers
-            let dlen = self.deferred_len as usize;
-            for i in 0..dlen {
-                self.push_pending(self.deferred[i]);
-            }
-            self.deferred_len = 0;
+            self.flush_prefix();
 
             // compact: shift path bytes from IMG_PATH_OFFSET to IMG_HEADER_LEN
             // + alt_len so they sit immediately after the alt buffer. then
@@ -1300,7 +1477,6 @@ impl HtmlStripStream {
         self.phase = Phase::Text;
     }
 }
-
 // pick the post-quote phase based on which attribute we captured. width and
 // height share the same accumulation phase as src and alt (`ImgSrcVal`); the
 // dispatch inside `capture_img_val_byte` decides what to do per byte.
@@ -1311,77 +1487,6 @@ fn next_img_val_phase(kind: u8) -> Phase {
     }
 }
 
-// case-insensitive prefix match: returns Some(end_index) into haystack at
-// the position past the prefix if matched, None otherwise.
-fn ascii_match_lower(haystack: &[u8], from: usize, prefix: &[u8]) -> Option<usize> {
-    if from + prefix.len() > haystack.len() {
-        return None;
-    }
-    for i in 0..prefix.len() {
-        if haystack[from + i].to_ascii_lowercase() != prefix[i] {
-            return None;
-        }
-    }
-    Some(from + prefix.len())
-}
-
-// scan a CSS-style attribute value for `text-align: <kw>` and return the
-// matching ALIGN_* marker byte. only the four keywords we know about are
-// recognised (left, center, right, justify); anything else returns None.
-// supports multiple `;`-separated declarations and is case-insensitive.
-fn parse_text_align(value: &[u8]) -> Option<u8> {
-    let n = value.len();
-    let mut i = 0usize;
-    while i < n {
-        // skip leading ws and stray semicolons between declarations
-        while i < n && (is_html_ws(value[i]) || value[i] == b';') {
-            i += 1;
-        }
-        if i >= n {
-            return None;
-        }
-        // try to match "text-align"
-        let after_name = if let Some(j) = ascii_match_lower(value, i, b"text-align") {
-            j
-        } else {
-            // skip to the next ';' to step past this declaration
-            while i < n && value[i] != b';' {
-                i += 1;
-            }
-            continue;
-        };
-        // consume optional ws, expect ':'
-        let mut j = after_name;
-        while j < n && is_html_ws(value[j]) {
-            j += 1;
-        }
-        if j >= n || value[j] != b':' {
-            // declaration like "text-align-foo:..."; not what we want
-            i = j;
-            while i < n && value[i] != b';' {
-                i += 1;
-            }
-            continue;
-        }
-        j += 1;
-        while j < n && is_html_ws(value[j]) {
-            j += 1;
-        }
-        // match value keyword
-        return if ascii_match_lower(value, j, b"center").is_some() {
-            Some(ALIGN_CENTER)
-        } else if ascii_match_lower(value, j, b"right").is_some() {
-            Some(ALIGN_RIGHT)
-        } else if ascii_match_lower(value, j, b"left").is_some() {
-            Some(ALIGN_LEFT)
-        } else if ascii_match_lower(value, j, b"justify").is_some() {
-            Some(ALIGN_JUSTIFY)
-        } else {
-            None
-        };
-    }
-    None
-}
 
 /// Strip HTML tags from a complete buffer **in place**, producing plain text
 /// without style markers.
@@ -1494,10 +1599,8 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
                     } else {
                         let mut tmp = [0u8; 4];
                         let n = encode_codepoint_utf8(cp, &mut tmp);
-                        for i in 0..n {
-                            buf[w] = tmp[i];
-                            w += 1;
-                        }
+                        buf[w..w + n].copy_from_slice(&tmp[..n]);
+                        w += n;
                         last_was_space = false;
                         trailing_nl = 0;
                     }
@@ -1604,67 +1707,126 @@ fn is_block_element(name: &[u8]) -> bool {
     )
 }
 
-// raw bytes injected before a tag's content for tag-keyed defaults. content
-// is bytes (markers and/or UTF-8 text) drained from the deferred queue once
-// the tag's first text byte arrives, so paragraph breaks emit first.
-//   h1 -> PAGE_BREAK + ALIGN_CENTER (heading marker comes from open_style_tag)
-//   h2 -> ALIGN_CENTER
-//   figcaption -> ITALIC_ON + ALIGN_CENTER (italic+centered caption)
-//   li -> U+2022 + ' ' (visible bullet glyph)
-fn tag_default_open(tag: &[u8]) -> &'static [u8] {
+// what a tag means before any stylesheet: the user-agent defaults of the
+// cascade. margins are quarter-em and follow the browser defaults (p 1em,
+// headings by level) so a book without CSS reads the way it does in a
+// browser; a book with CSS overrides any of this per rule
+fn ua_defaults(tag: &[u8]) -> StyleProps {
+    use css::*;
+    let mut p = StyleProps::EMPTY;
+    fn margins(p: &mut StyleProps, top: i8, bottom: i8) {
+        p.margin_top = top;
+        p.margin_bottom = bottom;
+        p.set |= PROP_MARGIN_TOP | PROP_MARGIN_BOTTOM;
+    }
+    fn italic(p: &mut StyleProps) {
+        p.font_style = FS_ITALIC;
+        p.set |= PROP_FONT_STYLE;
+    }
+    fn center(p: &mut StyleProps) {
+        p.text_align = TA_CENTER;
+        p.set |= PROP_TEXT_ALIGN;
+    }
     match tag {
-        b"h1" => &[MARKER, PAGE_BREAK, MARKER, ALIGN_CENTER],
-        b"h2" => &[MARKER, ALIGN_CENTER],
-        b"figcaption" => &[MARKER, ITALIC_ON, MARKER, ALIGN_CENTER],
-        b"li" => b"\xE2\x80\xA2 ",
-        _ => &[],
+        b"b" | b"strong" => {
+            p.font_weight = FW_BOLD;
+            p.set |= PROP_FONT_WEIGHT;
+        }
+        b"i" | b"em" | b"cite" | b"dfn" | b"var" | b"address" => italic(&mut p),
+        b"u" | b"ins" => {
+            p.text_decoration = TD_UNDERLINE;
+            p.set |= PROP_TEXT_DECORATION;
+        }
+        b"s" | b"strike" | b"del" => {
+            p.text_decoration = TD_LINE_THROUGH;
+            p.set |= PROP_TEXT_DECORATION;
+        }
+        b"p" => margins(&mut p, 4, 4),
+        b"h1" => {
+            margins(&mut p, 3, 3);
+            center(&mut p);
+            p.page_break_before = PB_ALWAYS;
+            p.set |= PROP_PAGE_BREAK;
+        }
+        b"h2" => {
+            margins(&mut p, 3, 3);
+            center(&mut p);
+        }
+        b"h3" => margins(&mut p, 4, 4),
+        b"h4" => margins(&mut p, 5, 5),
+        b"h5" => margins(&mut p, 7, 7),
+        b"h6" => margins(&mut p, 9, 9),
+        b"blockquote" => {
+            margins(&mut p, 4, 4);
+            p.margin_left = 4;
+            p.set |= PROP_MARGIN_LEFT;
+        }
+        b"ul" | b"ol" => {
+            margins(&mut p, 4, 4);
+            p.margin_left = 4;
+            p.set |= PROP_MARGIN_LEFT;
+        }
+        b"figure" | b"pre" | b"dl" => margins(&mut p, 4, 4),
+        b"figcaption" => {
+            italic(&mut p);
+            center(&mut p);
+        }
+        b"dd" => {
+            p.margin_left = 4;
+            p.set |= PROP_MARGIN_LEFT;
+        }
+        b"center" => center(&mut p),
+        _ => {}
+    }
+    p
+}
+
+fn heading_level(tag: &[u8]) -> u8 {
+    match tag {
+        b"h1" => 1,
+        b"h2" => 2,
+        b"h3" => 3,
+        b"h4" => 4,
+        b"h5" => 5,
+        b"h6" => 6,
+        _ => 0,
     }
 }
 
-// raw bytes appended to pending after a tag's natural close marker. used to
-// undo any alignment / inline-style override emitted by `tag_default_open`.
-fn tag_default_close(tag: &[u8]) -> &'static [u8] {
-    match tag {
-        b"h1" | b"h2" => &[MARKER, ALIGN_RESET],
-        b"figcaption" => &[MARKER, ITALIC_OFF, MARKER, ALIGN_RESET],
-        _ => &[],
-    }
+// elements that never have content or a close tag (br, hr and img have
+// their own handling in classify_tag)
+fn is_void_element(tag: &[u8]) -> bool {
+    matches!(
+        tag,
+        b"wbr"
+            | b"meta"
+            | b"link"
+            | b"input"
+            | b"col"
+            | b"area"
+            | b"base"
+            | b"embed"
+            | b"source"
+            | b"track"
+            | b"param"
+    )
 }
 
-// marker byte for formatting tags; used by classify_tag
-fn open_style_tag(tag: &[u8]) -> Option<u8> {
-    match tag {
-        b"b" | b"strong" => Some(BOLD_ON),
-        b"i" | b"em" | b"cite" => Some(ITALIC_ON),
-        b"u" | b"ins" => Some(UNDERLINE_ON),
-        b"s" | b"strike" | b"del" => Some(STRIKE_ON),
-        b"h1" => Some(H1_ON),
-        b"h2" => Some(H2_ON),
-        b"h3" => Some(H3_ON),
-        b"h4" => Some(H4_ON),
-        b"h5" => Some(H5_ON),
-        b"h6" => Some(H6_ON),
-        b"blockquote" => Some(QUOTE_ON),
-        b"figcaption" => Some(FIGCAPTION_ON),
-        _ => None,
-    }
+// a CSS length in signed quarter-em to the stream's unsigned field
+fn qem_u8(v: i8) -> u8 {
+    v.clamp(0, BlockProps::QEM_MAX as i8) as u8
 }
 
-fn close_style_tag(tag: &[u8]) -> Option<u8> {
-    match tag {
-        b"b" | b"strong" => Some(BOLD_OFF),
-        b"i" | b"em" | b"cite" => Some(ITALIC_OFF),
-        b"u" | b"ins" => Some(UNDERLINE_OFF),
-        b"s" | b"strike" | b"del" => Some(STRIKE_OFF),
-        b"h1" => Some(H1_OFF),
-        b"h2" => Some(H2_OFF),
-        b"h3" => Some(H3_OFF),
-        b"h4" => Some(H4_OFF),
-        b"h5" => Some(H5_OFF),
-        b"h6" => Some(H6_OFF),
-        b"blockquote" => Some(QUOTE_OFF),
-        b"figcaption" => Some(FIGCAPTION_OFF),
-        _ => None,
+fn inline_marker(bit: u8, on: bool) -> u8 {
+    match (bit, on) {
+        (INLINE_BOLD, true) => BOLD_ON,
+        (INLINE_BOLD, false) => BOLD_OFF,
+        (INLINE_ITALIC, true) => ITALIC_ON,
+        (INLINE_ITALIC, false) => ITALIC_OFF,
+        (INLINE_UNDERLINE, true) => UNDERLINE_ON,
+        (INLINE_UNDERLINE, false) => UNDERLINE_OFF,
+        (_, true) => STRIKE_ON,
+        (_, false) => STRIKE_OFF,
     }
 }
 
@@ -2006,4 +2168,380 @@ fn skip_pi(data: &[u8], pos: usize) -> usize {
         p += 1;
     }
     data.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markup::{Event, Events, SliceSource, Style};
+    use alloc::vec::Vec;
+
+    // run the stripper over `html` in `chunk`-byte input slices and a
+    // deliberately small output buffer, so every resume path is exercised
+    fn strip_chunked(html: &[u8], css: &CssRules, chunk: usize) -> Vec<u8> {
+        let mut s = HtmlStripStream::new();
+        let mut out = Vec::new();
+        let mut tmp = [0u8; 7];
+        let mut ip = 0;
+        while ip < html.len() {
+            let end = (ip + chunk).min(html.len());
+            let (consumed, written) = s.feed(&html[ip..end], &mut tmp, css);
+            out.extend_from_slice(&tmp[..written]);
+            if consumed == 0 && written == 0 {
+                panic!("no progress at {ip}");
+            }
+            ip += consumed;
+        }
+        loop {
+            let n = s.finish(&mut tmp);
+            out.extend_from_slice(&tmp[..n]);
+            if n < tmp.len() {
+                break;
+            }
+        }
+        out
+    }
+
+    fn strip(html: &str, css: &str) -> Vec<u8> {
+        let mut rules = CssRules::new();
+        rules.parse(css.as_bytes());
+        let whole = strip_chunked(html.as_bytes(), &rules, html.len().max(1));
+        let bytewise = strip_chunked(html.as_bytes(), &rules, 1);
+        assert_eq!(whole, bytewise, "chunked feed must not change output");
+        whole
+    }
+
+    fn events(bytes: &[u8]) -> Vec<Event> {
+        let mut src = SliceSource(bytes);
+        Events::new(&mut src).collect()
+    }
+
+    // (word text, style) for every Word event
+    fn words(bytes: &[u8]) -> Vec<(alloc::string::String, Style)> {
+        events(bytes)
+            .iter()
+            .filter_map(|e| match e {
+                Event::Word { start, end, style } => Some((
+                    alloc::string::String::from_utf8_lossy(&bytes[*start as usize..*end as usize])
+                        .into_owned(),
+                    *style,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn blocks(bytes: &[u8]) -> Vec<BlockProps> {
+        events(bytes)
+            .iter()
+            .filter_map(|e| match e {
+                Event::Block { block, .. } => Some(*block),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text(bytes: &[u8]) -> alloc::string::String {
+        let plain: Vec<u8> = {
+            let mut v = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == MARKER {
+                    i += if i + 1 < bytes.len() && bytes[i + 1] == BLOCK { BLOCK_LEN } else { 2 };
+                    continue;
+                }
+                v.push(bytes[i]);
+                i += 1;
+            }
+            v
+        };
+        alloc::string::String::from_utf8_lossy(&plain).into_owned()
+    }
+
+    #[test]
+    fn semantic_tags_style_words() {
+        let out = strip("<p>a <b>b</b> <i>c</i> <u>d</u> <s>e</s></p>", "");
+        let w = words(&out);
+        assert_eq!(w.len(), 5);
+        assert_eq!(w[0].1, Style::PLAIN);
+        assert!(w[1].1.bold);
+        assert!(w[2].1.italic);
+        assert!(w[3].1.underline);
+        assert!(w[4].1.strike);
+        assert_eq!(text(&out), "a b c d e\n");
+    }
+
+    #[test]
+    fn stylesheet_class_makes_italic() {
+        let out = strip(
+            "<p>a <span class=\"calibre4\">b</span> c</p>",
+            ".calibre4 { font-style: italic }",
+        );
+        let w = words(&out);
+        assert!(!w[0].1.italic);
+        assert!(w[1].1.italic);
+        assert!(!w[2].1.italic);
+    }
+
+    #[test]
+    fn multiple_classes_and_tag_class_selectors() {
+        let out = strip(
+            "<p class=\"body first\">a</p><p class=\"body\">b</p>",
+            "p.first { text-indent: 0 } .body { text-indent: 1.5em; margin: 0 }",
+        );
+        let b = blocks(&out);
+        // first paragraph: indent 0 (default record, so none emitted);
+        // second: 1.5em = 6 qem
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].text_indent_qem, 6);
+    }
+
+    #[test]
+    fn nested_bold_does_not_end_early() {
+        let out = strip(
+            "<p><b>a <span class=\"bold\">b</span> c</b> d</p>",
+            ".bold { font-weight: bold }",
+        );
+        let w = words(&out);
+        assert!(w[0].1.bold && w[1].1.bold && w[2].1.bold);
+        assert!(!w[3].1.bold);
+    }
+
+    #[test]
+    fn normal_inside_italic_restores() {
+        let out = strip(
+            "<p><em>a <span class=\"roman\">b</span> c</em></p>",
+            ".roman { font-style: normal }",
+        );
+        let w = words(&out);
+        assert!(w[0].1.italic);
+        assert!(!w[1].1.italic);
+        assert!(w[2].1.italic);
+    }
+
+    #[test]
+    fn unclosed_inline_ends_with_its_block() {
+        let out = strip("<p><b>a</p><p>b</p>", "");
+        let w = words(&out);
+        assert!(w[0].1.bold);
+        assert!(!w[1].1.bold);
+    }
+
+    #[test]
+    fn default_paragraph_gap_is_one_em_and_css_can_remove_it() {
+        let out = strip("<p>a</p><p>b</p>", "");
+        let b = blocks(&out);
+        assert_eq!(b.len(), 1, "only the second paragraph carries a gap");
+        assert_eq!(b[0].space_above_qem, 4);
+        assert_eq!(text(&out), "a\n\nb\n");
+
+        let out = strip("<p>a</p><p>b</p>", "p { margin: 0 }");
+        assert!(blocks(&out).is_empty());
+    }
+
+    #[test]
+    fn margins_collapse_to_the_larger() {
+        let out = strip(
+            "<h2>t</h2><p>x</p>",
+            "h2 { margin-bottom: 2em; text-align: left } p { margin-top: 1em }",
+        );
+        let b = blocks(&out);
+        assert_eq!(b.len(), 2, "the heading carries its own record for the left alignment");
+        assert_eq!(b[0].align, Align::Left);
+        assert_eq!(b[1].space_above_qem, 8);
+        assert_eq!(b[1].align, Align::Default);
+    }
+
+    #[test]
+    fn text_indent_is_inherited_and_overridable() {
+        let out = strip(
+            "<div class=\"c\"><p class=\"n\">a</p><p>b</p></div>",
+            ".c { text-indent: 1.5em } .n { text-indent: 0 } p { margin: 0 }",
+        );
+        let b = blocks(&out);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].text_indent_qem, 6);
+    }
+
+    #[test]
+    fn hanging_indent_flushes_left() {
+        let out = strip("<p>a</p>", "p { text-indent: -1em; margin: 0 }");
+        assert!(blocks(&out).is_empty());
+    }
+
+    #[test]
+    fn blockquote_and_margin_left_indent() {
+        let out = strip(
+            "<blockquote><p>q</p></blockquote><p class=\"e\">e</p>",
+            ".e { margin-left: 2em }",
+        );
+        let b = blocks(&out);
+        assert_eq!(b[0].left, 1);
+        assert_eq!(b[1].left, 2);
+    }
+
+    #[test]
+    fn display_none_hides_content_and_markers() {
+        let out = strip(
+            "<p>a</p><div style=\"display:none\"><p>h <b>x</b></p><img src=\"i.jpg\"/></div><p>b</p>",
+            "",
+        );
+        let w = words(&out);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].0, "a");
+        assert_eq!(w[1].0, "b");
+        assert!(!w[1].1.bold);
+        assert!(!out.contains(&IMG_REF));
+    }
+
+    #[test]
+    fn display_none_from_stylesheet_class() {
+        let out = strip(
+            "<p>a</p><p class=\"hidden\">x</p><p>b</p>",
+            ".hidden { display: none }",
+        );
+        assert_eq!(text(&out), "a\n\nb\n");
+    }
+
+    #[test]
+    fn self_closing_element_closes_at_once() {
+        let out = strip(
+            "<p>a<span class=\"i\"/>b <span class=\"i\" />c</p>",
+            ".i { font-style: italic }",
+        );
+        let w = words(&out);
+        assert!(w.iter().all(|(_, s)| !s.italic), "{w:?}");
+        assert_eq!(text(&out), "ab c\n");
+    }
+
+    #[test]
+    fn h1_page_breaks_and_centers_unless_css_says_otherwise() {
+        let out = strip("<p>a</p><h1>T</h1>", "");
+        let ev = events(&out);
+        let pb = ev.iter().position(|e| matches!(e, Event::PageBreak { .. })).unwrap();
+        let bl = ev.iter().position(|e| matches!(e, Event::Block { .. })).unwrap();
+        assert!(pb < bl, "page break must precede the block record");
+        let b = blocks(&out);
+        assert_eq!(b[0].align, Align::Center);
+        let w = words(&out);
+        assert_eq!(w[1].1.heading, 1);
+
+        let out = strip("<p>a</p><h1>T</h1>", "h1 { text-align: left }");
+        assert_eq!(blocks(&out)[0].align, Align::Left);
+    }
+
+    #[test]
+    fn inline_style_attribute_wins() {
+        let out = strip(
+            "<p class=\"l\" style=\"text-align:center; font-weight:bold\">x</p>",
+            ".l { text-align: left }",
+        );
+        assert_eq!(blocks(&out)[0].align, Align::Center);
+        assert!(words(&out)[0].1.bold);
+    }
+
+    #[test]
+    fn table_cells_are_separated() {
+        let out = strip("<table><tr><td>a</td><td>b</td></tr></table>", "");
+        let w = words(&out);
+        assert_eq!(w.len(), 2);
+    }
+
+    #[test]
+    fn hr_is_a_thematic_break() {
+        let out = strip("<p>a</p><hr/><p>b</p>", "");
+        let ev = events(&out);
+        assert!(ev.iter().any(|e| matches!(e, Event::ThematicBreak { .. })));
+        assert_eq!(text(&out), "a\n\nb\n");
+    }
+
+    #[test]
+    fn br_continues_the_block() {
+        let out = strip("<p style=\"text-align:right\">a<br/>b</p>", "");
+        let ev = events(&out);
+        assert!(ev.iter().any(|e| matches!(e, Event::HardBreak { .. })));
+        assert_eq!(blocks(&out).len(), 1);
+        let mut src = SliceSource(&out);
+        let mut it = Events::new(&mut src);
+        for e in it.by_ref() {
+            if matches!(e, Event::HardBreak { .. }) {
+                break;
+            }
+        }
+        assert_eq!(it.block().align, Align::Right);
+    }
+
+    #[test]
+    fn percent_indent_and_font_weight_number() {
+        let out = strip(
+            "<p class=\"p\"><span class=\"h\">x</span></p>",
+            ".p { text-indent: 3.8%; margin: 0 } .h { font-weight: 900 }",
+        );
+        assert_eq!(blocks(&out)[0].text_indent_qem, 3);
+        assert!(words(&out)[0].1.bold);
+    }
+
+    #[test]
+    fn display_block_span_breaks_lines() {
+        let out = strip("<p>a<span style=\"display:block\">b</span>c</p>", "");
+        assert_eq!(text(&out), "a\n\nb\n\nc\n");
+    }
+
+    #[test]
+    fn image_takes_the_prefix_and_keeps_alt_and_path() {
+        let out = strip(
+            "<p>a</p><figure><img src=\"x/y.jpg\" alt=\"A  cat\" width=\"10\" height=\"20\"/></figure>",
+            "",
+        );
+        let ev = events(&out);
+        let img = ev
+            .iter()
+            .find_map(|e| match e {
+                Event::Image(i) => Some(*i),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(img.alt(&out), b"A cat");
+        assert_eq!(img.path(&out), b"x/y.jpg");
+        assert_eq!(img.attr_w, 10);
+        assert_eq!(img.attr_h, 20);
+        assert_eq!(img.flags & IMG_FLAG_FIGURE, IMG_FLAG_FIGURE);
+    }
+
+    #[test]
+    fn li_gets_a_bullet_and_list_indent() {
+        let out = strip("<ul><li>a</li></ul>", "");
+        assert_eq!(text(&out), "\u{2022} a\n");
+        assert_eq!(blocks(&out)[0].left, 1);
+    }
+
+    #[test]
+    fn entities_and_whitespace_collapse() {
+        let out = strip("<p>a&amp;b   c&nbsp;d\n\te</p>", "");
+        assert_eq!(text(&out), "a&b c d e\n");
+    }
+
+    #[test]
+    fn stray_close_tags_are_ignored() {
+        let out = strip("</b><p>a</span></p></div>", "");
+        assert_eq!(text(&out), "a\n");
+        assert!(!words(&out)[0].1.bold);
+    }
+
+    #[test]
+    fn deep_nesting_beyond_the_stack_degrades_gracefully() {
+        let mut html = alloc::string::String::new();
+        for _ in 0..40 {
+            html.push_str("<span>");
+        }
+        html.push('x');
+        for _ in 0..40 {
+            html.push_str("</span>");
+        }
+        html.push_str("<b>y</b>");
+        let out = strip(&html, "");
+        let w = words(&out);
+        assert_eq!(w[0].0, "x");
+        assert!(w[1].1.bold);
+    }
 }

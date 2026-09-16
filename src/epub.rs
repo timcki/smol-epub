@@ -1130,6 +1130,31 @@ fn truncate_utf8(s: &[u8], max: usize) -> usize {
     n
 }
 
+/// Call `f` with the ZIP entry index of every stylesheet in the OPF
+/// manifest, in manifest order: items with `media-type="text/css"` or
+/// an `href` ending in `.css`. Chapters usually link all of them, so a
+/// reader parses them into one [`crate::css::CssRules`] per book.
+pub fn for_each_stylesheet(opf: &[u8], opf_dir: &str, zip: &ZipIndex, mut f: impl FnMut(usize)) {
+    let mut path_buf = [0u8; 512];
+    xml::for_each_tag(opf, b"item", |tag_bytes| {
+        let Some(href) = xml::get_attr(tag_bytes, b"href") else {
+            return;
+        };
+        let by_type = xml::get_attr(tag_bytes, b"media-type").is_some_and(|m| m == b"text/css");
+        let by_name = href.len() > 4 && href[href.len() - 4..].eq_ignore_ascii_case(b".css");
+        if !by_type && !by_name {
+            return;
+        }
+        let decoded = percent_decode(href);
+        let href_str = core::str::from_utf8(&decoded).unwrap_or("");
+        let full_len = resolve_path(opf_dir, href_str, &mut path_buf);
+        let full_path = core::str::from_utf8(&path_buf[..full_len]).unwrap_or("");
+        if let Some(idx) = zip.find(full_path).or_else(|| zip.find_icase(full_path)) {
+            f(idx);
+        }
+    });
+}
+
 /// Check if a filename looks like an EPUB (`.epub` or `.epu` for FAT 8.3 truncation).
 pub fn is_epub_filename(name: &str) -> bool {
     let b = name.as_bytes();
