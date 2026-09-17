@@ -844,9 +844,108 @@ pub fn decode_utf8(buf: &[u8]) -> (char, usize) {
 
 // ── tests ───────────────────────────────────────────────────────────
 
+// ── anchors ─────────────────────────────────────────────────────────
+
+/// A position in a chapter that survives re-stripping: the ordinal of
+/// the paragraph and of the word within it. Byte offsets move when the
+/// stripper changes what it emits between words (a block record, a
+/// style toggle); the count of words does not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Anchor {
+    /// Paragraph ordinal, counting [`Event::ParagraphBreak`]s before it.
+    pub para: u32,
+    /// Ordinal of the word (or image) within the paragraph.
+    pub word: u32,
+}
+
+/// The anchor of the first word or image that ends after `offset`.
+/// Past the last word this is one beyond the last word of the last
+/// paragraph, which [`offset_of`] maps back to the chapter's end.
+pub fn anchor_at(src: &mut dyn ByteSource, offset: usize) -> Anchor {
+    let mut a = Anchor::default();
+    let mut ev = Events::new(src);
+    while let Some(e) = ev.next_event() {
+        match e {
+            Event::Word { end, .. } if end as usize > offset => return a,
+            Event::Image(img) if img.end as usize > offset => return a,
+            Event::Word { .. } | Event::Image(_) => a.word += 1,
+            Event::ParagraphBreak { .. } => {
+                a.para += 1;
+                a.word = 0;
+            }
+            _ => {}
+        }
+    }
+    a
+}
+
+/// The byte offset `anchor` names: the start of that word, or the end
+/// of the paragraph when it has fewer words than `anchor.word`, or the
+/// chapter's end when it has fewer paragraphs.
+pub fn offset_of(src: &mut dyn ByteSource, anchor: Anchor) -> u32 {
+    let mut para = 0u32;
+    let mut word = 0u32;
+    let mut ev = Events::new(src);
+    while let Some(e) = ev.next_event() {
+        match e {
+            Event::Word { start, .. } | Event::Image(ImageRef { start, .. }) => {
+                if para == anchor.para && word == anchor.word {
+                    return start;
+                }
+                word += 1;
+            }
+            Event::ParagraphBreak { start, .. } => {
+                if para == anchor.para {
+                    return start;
+                }
+                para += 1;
+                word = 0;
+            }
+            _ => {}
+        }
+    }
+    ev.offset()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchors_round_trip_and_survive_inserted_records() {
+        let mut a = b"one two\n\nthree four five\n\nsix".to_vec();
+        let off_four = a.windows(4).position(|w| w == b"four").unwrap();
+        let anchor = anchor_at(&mut SliceSource(&a), off_four);
+        assert_eq!(anchor, Anchor { para: 1, word: 1 });
+        assert_eq!(offset_of(&mut SliceSource(&a), anchor) as usize, off_four);
+        // an offset inside a word anchors to that word
+        assert_eq!(anchor_at(&mut SliceSource(&a), off_four + 2), anchor);
+
+        // the same text with a block record ahead of every paragraph
+        // and an italic toggle: every byte offset moved, no anchor did
+        let mut b = alloc::vec![MARKER, BLOCK, 0, 6, 0];
+        b.extend_from_slice(b"one two\n\n");
+        b.extend_from_slice(&[MARKER, BLOCK, 0, 6, 0, MARKER, ITALIC_ON]);
+        b.extend_from_slice(b"three four five");
+        b.extend_from_slice(&[MARKER, ITALIC_OFF]);
+        b.extend_from_slice(b"\n\nsix");
+        let off_four_b = b.windows(4).position(|w| w == b"four").unwrap();
+        assert_ne!(off_four, off_four_b);
+        assert_eq!(offset_of(&mut SliceSource(&b), anchor) as usize, off_four_b);
+
+        // past the paragraph's words: its end; past the chapter: its end
+        a.push(b' ');
+        let end_p1 = a.windows(2).rposition(|w| w == b"\n\n").unwrap();
+        assert_eq!(
+            offset_of(&mut SliceSource(&a), Anchor { para: 1, word: 9 }) as usize,
+            end_p1
+        );
+        assert_eq!(
+            offset_of(&mut SliceSource(&a), Anchor { para: 7, word: 0 }) as usize,
+            a.len()
+        );
+        assert_eq!(anchor_at(&mut SliceSource(&a), a.len()), Anchor { para: 2, word: 1 });
+    }
 
     fn img_record(alt: &[u8], path: &[u8]) -> alloc::vec::Vec<u8> {
         let mut v = alloc::vec![MARKER, IMG_REF, 0, 0, 0, 0, 0, alt.len() as u8, path.len() as u8];
