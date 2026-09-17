@@ -322,6 +322,38 @@ impl ImageRef {
         })
     }
 
+    /// Find the next complete record at or after `from`, walking the
+    /// stream record by record so a [`BLOCK`] payload byte that happens
+    /// to equal [`MARKER`] is never mistaken for a record start (a
+    /// paragraph with a quarter-em gap whose text begins with `P` looks
+    /// exactly like an IMG_REF header to a raw byte scan). `Err` carries
+    /// the offset the walk stopped at: the end of `bytes`, or the start
+    /// of a record that runs past it, which a caller reading the stream
+    /// in windows resumes from.
+    pub fn find_next(bytes: &[u8], from: usize) -> Result<Self, usize> {
+        let mut i = from;
+        while i < bytes.len() {
+            if bytes[i] != MARKER {
+                i += 1;
+                continue;
+            }
+            if i + 1 >= bytes.len() {
+                return Err(i);
+            }
+            match bytes[i + 1] {
+                BLOCK => {
+                    if i + BLOCK_LEN > bytes.len() {
+                        return Err(i);
+                    }
+                    i += BLOCK_LEN;
+                }
+                IMG_REF => return Self::parse(bytes, i).ok_or(i),
+                _ => i += 2,
+            }
+        }
+        Err(bytes.len())
+    }
+
     /// The alt-text slice of the stream `bytes` this record was parsed from.
     #[inline]
     pub fn alt<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
@@ -815,6 +847,44 @@ pub fn decode_utf8(buf: &[u8]) -> (char, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn img_record(alt: &[u8], path: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec![MARKER, IMG_REF, 0, 0, 0, 0, 0, alt.len() as u8, path.len() as u8];
+        v.extend_from_slice(alt);
+        v.extend_from_slice(path);
+        v
+    }
+
+    #[test]
+    fn find_next_skips_block_payload_that_looks_like_a_header() {
+        // gap of one quarter-em then a paragraph starting with "P": the
+        // payload byte 0x01 followed by 'P' is not an IMG_REF
+        let mut s = alloc::vec![MARKER, BLOCK, 0, 6, 1];
+        s.extend_from_slice(b"Pretty soon the whole crew knew. ");
+        assert_eq!(ImageRef::find_next(&s, 0), Err(s.len()));
+
+        let at = s.len();
+        s.extend_from_slice(&img_record(b"Chapter 7", b"../images/a.jpg"));
+        let img = ImageRef::find_next(&s, 0).unwrap();
+        assert_eq!(img.start as usize, at);
+        assert_eq!(img.path(&s), b"../images/a.jpg");
+        assert_eq!(ImageRef::find_next(&s, img.end as usize), Err(s.len()));
+    }
+
+    #[test]
+    fn find_next_stops_at_a_record_cut_by_the_window() {
+        let mut s = alloc::vec![MARKER, ITALIC_ON];
+        s.extend_from_slice(b"ab ");
+        let at = s.len();
+        s.extend_from_slice(&img_record(b"", b"x.png"));
+        let cut = &s[..s.len() - 2];
+        assert_eq!(ImageRef::find_next(cut, 0), Err(at));
+        let mut b = alloc::vec![MARKER, BLOCK, 2];
+        assert_eq!(ImageRef::find_next(&b, 0), Err(0));
+        b.push(0);
+        b.push(0);
+        assert_eq!(ImageRef::find_next(&b, 0), Err(5));
+    }
     use alloc::vec::Vec;
 
     fn drain(bytes: &[u8]) -> Vec<Event> {
