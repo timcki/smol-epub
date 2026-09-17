@@ -16,6 +16,7 @@
 //! | [`epub`] | EPUB structure: `container.xml` → OPF → spine / metadata / TOC |
 //! | [`html_strip`] | Single-pass, streaming HTML-to-styled-text converter |
 //! | [`markup`] | The styled-text encoding: marker constants and the `Events` decoder |
+//! | [`hyphen`] | Dictionary hyphenation of a word's bytes *(feature `hyphenation`)* |
 //! | [`cache`] | Chapter decompress-and-strip pipeline with cache metadata |
 //! | [`png`] | PNG decoder → 1-bit Floyd–Steinberg dithered bitmap *(feature `images`)* |
 //! | [`jpeg`] | JPEG decoder → 1-bit Floyd–Steinberg dithered bitmap *(feature `images`)* |
@@ -25,6 +26,7 @@
 //! | Flag | Default | Description |
 //! |------|---------|-------------|
 //! | `images` | ✓ | Enable [`png`] and [`jpeg`] image decoders |
+//! | `hyphenation` | | Enable [`hyphen`] (English and Polish patterns via `hypher`) |
 //!
 //! ## Streaming I/O model
 //!
@@ -83,6 +85,8 @@ pub mod cache;
 pub mod css;
 pub mod epub;
 pub mod html_strip;
+#[cfg(feature = "hyphenation")]
+pub mod hyphen;
 pub mod markup;
 pub mod xml;
 pub mod zip;

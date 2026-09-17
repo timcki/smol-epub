@@ -13,6 +13,8 @@ use crate::zip::ZipIndex;
 pub const TITLE_CAP: usize = 64;
 /// Maximum byte length of an EPUB author name.
 pub const AUTHOR_CAP: usize = 64;
+/// Maximum byte length kept of the `dc:language` tag.
+pub const LANG_CAP: usize = 8;
 /// Maximum number of spine entries (reading-order items).
 pub const MAX_SPINE: usize = 256;
 /// Maximum byte length of the OPF file path inside the ZIP.
@@ -43,6 +45,10 @@ pub struct EpubMeta {
     pub cover_zip_index: u16,
     /// Media type of the cover image (meaningful only when [`cover_zip_index`](Self::cover_zip_index) ≠ `0xFFFF`).
     pub cover_media_type: CoverMediaType,
+    /// Raw bytes of the `dc:language` tag (`"en"`, `"pl-PL"`), up to [`LANG_CAP`].
+    pub lang: [u8; LANG_CAP],
+    /// Number of valid bytes in [`lang`](Self::lang); `0` when the OPF names none.
+    pub lang_len: u8,
 }
 
 impl Default for EpubMeta {
@@ -64,6 +70,8 @@ impl EpubMeta {
             author_len: 0,
             cover_zip_index: Self::NO_COVER,
             cover_media_type: CoverMediaType::Unknown,
+            lang: [0u8; LANG_CAP],
+            lang_len: 0,
         }
     }
 
@@ -75,6 +83,11 @@ impl EpubMeta {
     /// Return the author as a `&str`, or `""` if it is not valid UTF-8.
     pub fn author_str(&self) -> &str {
         core::str::from_utf8(&self.author[..self.author_len as usize]).unwrap_or("")
+    }
+
+    /// The `dc:language` value as bytes (empty when absent).
+    pub fn lang(&self) -> &[u8] {
+        &self.lang[..self.lang_len as usize]
     }
 
     /// Returns `true` if a cover image was found in the EPUB metadata.
@@ -296,6 +309,11 @@ pub fn parse_opf(
     }
     if let Some(author) = xml::tag_text(opf, b"creator") {
         meta.set_author(author);
+    }
+    if let Some(lang) = xml::tag_text(opf, b"language") {
+        let n = lang.len().min(LANG_CAP);
+        meta.lang[..n].copy_from_slice(&lang[..n]);
+        meta.lang_len = n as u8;
     }
 
     // ── cover discovery ─────────────────────────────────────────────

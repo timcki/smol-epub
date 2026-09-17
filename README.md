@@ -22,6 +22,8 @@ and images. smol-epub handles the full pipeline:
 - **markup** — the styled-text encoding: inline toggles, one absolute
   block record per paragraph, image references, and the `Events` decoder
   every consumer walks the stream with
+- **hyphen** — dictionary hyphenation of one word's bytes via `hypher`
+  (feature `hyphenation`; English and Polish patterns compiled in)
 - **cache** — chapter decompress-and-strip pipeline with cache metadata
 - **png** — PNG decoder → 1-bit Floyd–Steinberg dithered bitmap
 - **jpeg** — JPEG decoder → 1-bit Floyd–Steinberg dithered bitmap

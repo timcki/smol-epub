@@ -14,6 +14,9 @@ readme = "README.md"
 [dependencies]
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 log = "0.4"
+# dictionary hyphenation (Typst's Liang tries); languages are picked
+# here so the pattern data stays bounded on flash-sized targets
+hypher = { version = "0.1", optional = true, default-features = false, features = ["english", "polish"] }
 
 [dev-dependencies]
 env_logger = "0.11"
@@ -22,3 +25,4 @@ env_logger = "0.11"
 default = ["images"]
 images = []
 async = []
+hyphenation = ["dep:hypher"]
