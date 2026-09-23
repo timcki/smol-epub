@@ -806,6 +806,7 @@ pub struct StreamStripStep {
     comp_left: usize,
     out_pos: usize,     // write position in circular window (deflate)
     remaining: u32,     // bytes left to read (stored)
+    input_size: u32,    // bytes the entry occupies in the archive
 
     // HTML stripper
     stripper: HtmlStripStream,
@@ -849,6 +850,7 @@ impl StreamStripStep {
                     comp_left: 0,
                     out_pos: 0,
                     remaining: entry.uncomp_size,
+                    input_size: entry.uncomp_size,
                     stripper: HtmlStripStream::new(),
                     strip_buf: [0u8; STRIP_BUF_SIZE],
                     strip_pos: 0,
@@ -893,6 +895,7 @@ impl StreamStripStep {
                     comp_left: entry.comp_size as usize,
                     out_pos: 0,
                     remaining: 0,
+                    input_size: entry.comp_size,
                     stripper: HtmlStripStream::new(),
                     strip_buf: [0u8; STRIP_BUF_SIZE],
                     strip_pos: 0,
@@ -908,6 +911,17 @@ impl StreamStripStep {
     #[inline]
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Archive bytes read so far and the entry's size in the archive,
+    /// for a progress figure. The read runs at most one buffer ahead
+    /// of the stripper.
+    pub fn progress(&self) -> (u32, u32) {
+        let left = match self.method {
+            METHOD_STORED => self.remaining,
+            _ => self.comp_left as u32,
+        };
+        (self.input_size.saturating_sub(left), self.input_size)
     }
 
     /// Advance the pipeline by a bounded amount of work.
